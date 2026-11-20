@@ -2,10 +2,9 @@
 memory/MEMORY.md
 memory/.MEMORY.md.*
 
-# The sources hive.lock pins, each a clone kept out of this repository's history. Sync adds any other
-# source to .git/info/exclude when it clones one.
+# The core, a clone made before the engine runs. Sync keeps the other sources hive.lock pins out of
+# this repository's history in .git/info/exclude, as it clones each.
 /hive-mind/
-/agent-skills/
 
 .DS_Store
 __pycache__/

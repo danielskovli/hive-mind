@@ -1,7 +1,8 @@
 # Setting up a hive
 
-What goes where, how a machine and an agentctl sandbox are set up, and what has been verified. The
-hive-setup skill follows this page. When in doubt, `hive status` checks the machine it runs on against
+How a hive is made, how a machine and an agentctl sandbox are set up, and how the hive keeps itself
+tidy. Where each kind of knowledge goes is in `instructions/hive.md` ("Where things go"), which every
+session loads. The hive-setup skill follows this page. When in doubt, `hive status` checks the machine it runs on against
 this page, and names the section to read for anything that is off.
 
 ## Getting one
@@ -11,29 +12,17 @@ Paste this into Claude Code, on the machine you use most:
 > Set up a hive for me: clone https://github.com/danielskovli/hive-mind to a temporary folder and follow
 > its skills/hive-setup/SKILL.md.
 
+You need `git`, `python3`, `jq`, Claude Code, and `gh` signed in to the account that will own the hive,
+with the `workflow` scope (`gh auth refresh -s workflow`): the hive's first push carries its workflow.
 The session asks your name, the GitHub account to own the hive, what you work on, and whether you want
 `agent-skills` and the Worklog. It then creates your private repository from `template/`, pins this
 core (and `agent-skills`) in its `hive.lock`, clones it to `~/hive`, and runs `hive install`. On another
 machine, ask a session to "set up my hive from https://github.com/<you>/hive on this machine".
 
-## What goes where
-
-Each kind of knowledge has one home. A second copy is a bug: it loads twice, and the copies drift.
-
-| What | Lives in | Changed by | Reaches |
-| --- | --- | --- | --- |
-| How a hive works | the core: `instructions/hive.md`, its skills | pull request to the core, then `hive upgrade` | every session |
-| How you work, anywhere: instructions, skills | your hive: `instructions/`, `skills/` | pull request | every session, every machine |
-| Skills shared with others | a source such as `agent-skills` | pull request there, then `hive upgrade` | every session |
-| What sessions learned | your hive: `memory/` | sessions, as they work | every session |
-| Why things are as they are | your hive: `decisions/` | sessions and retros | retros |
-| What every sandbox, and only sandboxes, should know | your hive: `sandbox/host-instructions.md` | pull request | every sandbox session of an agent whose variant lists it |
-| What anyone needs to work in a repository | the repository's `AGENTS.md` | that team | sessions in that repository |
-| What only one machine needs | `~/.claude/CLAUDE.md` there | you | sessions on that machine |
-| Tasks, ideas for later, handoffs | your tracker, such as the Worklog (backed up in the hive's `worklog/`) | both of you | on demand |
-| Secrets | never the hive: the keychain, environment, a sandbox's secrets | you | where you put them |
-
 ## A machine
+
+It needs `git`, `python3` (for the JSON edit), `jq` (for the tidy's harvest) and a POSIX shell; Linux and
+macOS have all but `jq` already.
 
 ```sh
 git clone https://github.com/<you>/hive ~/hive
@@ -52,12 +41,12 @@ git clone -q "$1" ~/hive/hive-mind && git -C ~/hive/hive-mind checkout -q --deta
   and adds hooks that run `~/hive/hive-mind/bin/hive`: sync at SessionStart, save at Stop and SessionEnd,
   the keep-alive at Stop, UserPromptSubmit and SessionEnd, and a PreToolUse guard that refuses edits to
   the hive outside `memory/`, `decisions/` and `worklog/`. Everything else in the file is kept, and a
-  linked settings file stays linked. Hooks of a hive cloned elsewhere, or of its predecessor
-  agent-brain, are replaced.
+  linked settings file stays linked. Hooks of a hive cloned elsewhere are replaced.
 - `~/.claude/rules/hive-mind` and `~/.claude/rules/hive`: links to the core's and the hive's
   `instructions/`.
-- `~/.claude/skills/<name>`: a link per skill, from the highest layer that has it (the hive's own, then
-  the sources from the last in `hive.lock` to the first). A copy there that matches is replaced, and a
+- `~/.claude/skills/<name>`: a link per skill, from the highest layer that has it: in an agentctl
+  sandbox the agent's own skill, which is left in place; then the hive's own; then the sources from the
+  last in `hive.lock` to the first, the core. A link into a source the lock no longer pins goes. A copy there that matches is replaced, and a
   link to a checkout that is gone; anything else is left alone and reported (`--force` moves it to
   `~/.claude/hive-backup/`).
 - `~/.local/bin/hive`: a link to the core's `bin/hive`, so `hive status`, `hive sync` and the rest run
@@ -65,7 +54,6 @@ git clone -q "$1" ~/hive/hive-mind && git -C ~/hive/hive-mind checkout -q --deta
   there is left alone.
 
 Nothing else: no daemon, no scheduled job. `hive` runs when Claude Code's hooks call it or when you do.
-It needs `git`, `python3` (for the JSON edit) and a POSIX shell; Linux and macOS both have them.
 
 Every Claude Code session on the machine, in any directory, now uses the hive's memory. Keep the
 checkout on `main`; work on the hive itself in a worktree (see "Changing instructions, skills and
@@ -86,7 +74,8 @@ leaves the settings alone: agentd puts the agent's home over them (see "agentctl
 
 ## Sources and upgrades
 
-`hive.lock` names each source the hive runs, one line each, `<name> <git URL> <commit>`, the core first.
+`hive.lock` names each source the hive runs, one line each, `<name> <git URL> <commit>`. The core comes
+first, named `hive-mind`, and the engine runs from that clone; sync and status refuse a lock that differs.
 Every machine runs exactly those commits: a sync fetches every pinned commit before it moves the hive,
 and if one cannot be fetched, the hive and every source stay where they were (memory still goes out),
 and the session is told which source. `hive upgrade [source]` pins the newest commit of each source's
@@ -95,9 +84,10 @@ its next sync. Two machines upgrading at once both land, source by source. To go
 commit that moved the pin.
 
 A source is never edited in place: the guard refuses it, as it refuses `hive.lock`. Change one by pull
-request in its own repository, from a clone elsewhere, then upgrade. To add a source, add its line to
-`hive.lock` by pull request in the hive (a name that is not one of the hive's own folders, its URL, a
-commit); sync clones it.
+request in its own repository, from a clone elsewhere, then upgrade. To add a source, move one to a new
+URL (a fork, a transferred repository) or drop one, change its line in `hive.lock` by pull request in the
+hive; every machine follows at its next sync. A dropped source's skills stop loading, and its clone stays
+on disk.
 
 ## agentctl
 
@@ -187,17 +177,6 @@ It relies on `asyncRewake`, a hook option missing from Claude Code's public docs
 under a Claude Code binary that still has it, and checks that each ping's turn read the context from the
 cache. When either fails, a tidy becomes due, and its drift step judges what changed.
 
-## Where do I put…
-
-- **A preference, or a correction?** Just say it. The session writes it to memory as a default, unless
-  you say it is a rule; the retro promotes it once it has proven itself.
-- **A rule for every session, everywhere?** The hive's `instructions/`, by pull request.
-- **A procedure you repeat?** A skill in the hive's `skills/`, by pull request.
-- **Something only sandboxes need?** The hive's `sandbox/host-instructions.md`, below the pointer.
-- **Something anyone working in a repository needs?** That repository's `AGENTS.md`.
-- **Something only one machine needs?** `~/.claude/CLAUDE.md` there.
-- **A secret?** Never the hive. Write down where it lives, not what it is.
-
 ## Checking it
 
 `hive status`, on any machine or inside a sandbox, prints where the hive stands against origin and its
@@ -205,17 +184,6 @@ sources, then one line per setup check: `ok`, `fix` (with the section of this pa
 
 ## What has been verified
 
-`tests/check.sh`, on macOS (Apple Git 2.54, `/bin/sh` and `bash --posix`), and in CI on Linux and
-macOS: `tests/hive.test.sh` builds a hive from `template/`, with a core and a second source as remotes,
-and runs throwaway machines against it. It covers install and uninstall against existing and linked
-settings and skills, concurrent installs, a moved checkout and the predecessor's hooks; saves from
-several machines with conflicting, cleanly merging, re-confirming and edit-versus-delete changes;
-non-ASCII and case-colliding names; an uncommitted edit an incoming change would overwrite; a crashed
-git, a stale and a live lock, SIGTERM; secrets; a shrinking Worklog backup; the index budget; the guard;
-the automatic tidy's triggers and claim (with a stub for Claude); offline; a checkout off `main`; the
-pointer's commands; a stress run of three machines with four sessions each; the skill layers; upgrades,
-alone and racing on two machines; a pin that cannot be fetched, which leaves the hive and its sources
-where they were; and a sync that replaces the core it runs from.
-
-`tests/claude.test.sh` runs real Claude Code sessions against such a hive, inside an agentctl sandbox
-only.
+`sh tests/check.sh` runs every offline check, on macOS and Linux in CI: what each scenario covers is in
+`tests/hive.test.sh`, a check per line. `tests/claude.test.sh` runs real Claude Code sessions against a
+hive, inside an agentctl sandbox only.

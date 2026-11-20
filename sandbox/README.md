@@ -1,11 +1,12 @@
 # A hive in an agentctl sandbox
 
 A sandbox is wiped by `agentctl delete`, so it cannot keep the hive; it clones it. What tells it to is the
-hive's `sandbox/host-instructions.md`: a short pointer that your own variant of each agent
-(`agent.mine.yaml`) lists among its instructions, after agentd's "Agent sandbox" section and ahead of the
-agent's own. The pointer says where the hive is, how to tell whether it loaded, the commands that bring
-it up, and to pass on what `hive status` marks `fix`. It never repeats what the hive says, so there is
-nothing to keep in sync.
+hive's `sandbox/host-instructions.md`, which your own variant of each agent (`agent.mine.yaml`) lists
+among its instructions, after agentd's "Agent sandbox" section and ahead of the agent's own. It holds
+two things: the pointer, which says where the hive is, how to tell whether it loaded, the commands that
+bring it up, and to pass on what `hive status` marks `fix`; and below it, the rules every sandbox
+follows, hive or not, such as what leaving the sandbox means and keeping it lean. Neither repeats what
+the hive's instructions say.
 
 In a new sandbox the first session finds no hive, runs the commands (clone the hive and its core,
 `hive install`, sync), reads the instructions and memory index, and says so. `hive install` clones the

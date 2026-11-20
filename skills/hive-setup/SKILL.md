@@ -15,12 +15,12 @@ https://github.com/danielskovli/hive-mind to a temporary folder). `<core>` below
 
 ## Before anything
 
-- Needs `git`, `python3`, a POSIX shell (macOS or Linux; on Windows, WSL), Claude Code, and `gh` signed
-  in (`gh auth status`) to the GitHub account that will own the hive.
+- Needs `git`, `python3`, `jq`, a POSIX shell (macOS or Linux; on Windows, WSL), Claude Code, and `gh`
+  signed in (`gh auth status`) to the GitHub account that will own the hive, with the `workflow` scope:
+  the first push carries the hive's workflow (`gh auth refresh -s workflow` adds it).
 - If `~/hive` exists, or `~/.claude/rules/hive` is a link, the user has a hive on this machine: stop and
   ask what they want.
-- If the user already has a hive and only this machine needs it, skip to "On this machine" with their
-  repository's URL.
+- If the user already has a hive and only this machine needs it, skip to "On this machine".
 
 ## Ask, in one message
 
@@ -46,10 +46,11 @@ Then fill in `$work`:
   `<core>`'s origin and the commit it is at: `git -C <core> remote get-url origin`, `git -C <core>
   rev-parse HEAD` (a commit on its `main`, so other machines can fetch it). agent-skills' commit is
   `git ls-remote https://github.com/danielskovli/agent-skills HEAD`. Without agent-skills, delete its
-  line here and in `.gitignore`.
+  line.
 - `instructions/me.md`: replace every placeholder from their answers, and remove the comment.
 - `sandbox/host-instructions.md`: replace `https://github.com/OWNER/hive` with the hive's URL.
-- Read every file once more for a placeholder left in capitals.
+- Check that no placeholder is left: `grep -rn -e 0000000000000000000000000000000000000000 -e OWNER
+  -e NAME -e GITHUB_USER -e "WHAT THEY" -e "WHERE TASKS" "$work"` prints nothing.
 
 ```sh
 gh repo create <owner>/<name> --private --description "My hive: instructions, skills and memory for Claude Code"
@@ -59,15 +60,9 @@ git -C "$work" remote add origin https://github.com/<owner>/<name> && git -C "$w
 
 ## On this machine
 
-```sh
-git clone -q https://github.com/<owner>/<name> ~/hive
-set -- $(awk '!/^[[:space:]]*(#|$)/ { print $2, $3; exit }' ~/hive/hive.lock)
-git clone -q "$1" ~/hive/hive-mind && git -C ~/hive/hive-mind checkout -q --detach "$2"
-~/hive/hive-mind/bin/hive install && ~/hive/hive-mind/bin/hive status
-```
-
-`install` clones the other sources, links the rules and skills, and sets Claude Code's settings: what
-it changes is in the core's `SETUP.md` ("A machine"). Read its output to the user:
+Run the commands in `<core>/SETUP.md`, section "A machine", with the hive's URL, then
+`~/hive/hive-mind/bin/hive status`. `install` clones the other sources, links the rules and skills, and
+sets Claude Code's settings, as that section lists. Read its output to the user:
 
 - `autoMemoryDirectory is already …`: their memory lives somewhere else. Ask before rerunning with
   `--force`, which points it at the hive.

@@ -1,7 +1,8 @@
 # hive-mind
 
 The core of a **hive**: one person's working instructions, skills, memory and decisions, shared by every
-Claude Code session they run, on every machine, laptop and sandboxes alike. A session that learns
+Claude Code session they run, on every machine: a laptop, and sandboxes such as those
+[agentctl](https://github.com/digdir/digdir-agents) runs. A session that learns
 something writes it down; the next session, anywhere, starts with it.
 
 A hive is a private repository of your own, made from this core's template. This repository is the
@@ -12,7 +13,7 @@ engine every hive runs:
 - `instructions/hive.md`, how sessions use a hive, loaded into every session.
 - Skills that keep a hive running: `consolidate-hive` (an automatic tidy of memory, and your retro),
   `hive-setup` and `worklog-setup` (an optional task tracker on claude.ai).
-- `template/`, the hive a new one starts from, and `sandbox/`, for agentctl sandboxes.
+- `template/`, the hive a new one starts from, and `sandbox/`, for agentctl's sandboxes.
 
 ## Get a hive
 
@@ -22,7 +23,8 @@ Paste this into Claude Code:
 > its skills/hive-setup/SKILL.md.
 
 It asks a few questions, creates your private repository, and wires Claude Code to it. `SETUP.md` says
-what it changes and how the parts fit.
+what it changes, how a hive pins and upgrades the repositories it runs, and which skill wins when two
+share a name.
 
 ## How a hive is laid out
 
@@ -37,11 +39,6 @@ what it changes and how the parts fit.
   hive-mind/             this core, a clone at its pin
   agent-skills/          another source, if you pinned it
 ```
-
-A hive pins each source in `hive.lock`, and every machine runs exactly the commits its hive names:
-`hive sync` fetches them before it moves the hive, then moves both. `hive upgrade` moves the pins to each
-source's newest commit and pushes them. When two layers have a skill of the same name, the higher wins:
-your hive's, then the sources from the last in `hive.lock` to the first, this core.
 
 ## Commands
 
