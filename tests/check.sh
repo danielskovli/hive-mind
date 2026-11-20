@@ -123,6 +123,14 @@ mkdir -p "$stale/decisions/tidy" && printf '# Tidy, 2099-01-01\n' >"$stale/decis
 sh "$stale/hive-mind/tests/invariants.sh" 2>/dev/null | grep -q '^ok   the last tidy ran less than ten days ago' \
     && ok "the daily check passes after a tidy" || fail "the daily check passes after a tidy"
 
+# A hive just made from the template has no memory yet, so its first daily check asks for no tidy.
+fresh="$tmp/fresh"
+mkdir -p "$fresh/hive-mind/tests" && cp -R "$root/template/." "$fresh/" && cp -R "$root/bin" "$fresh/hive-mind/" && cp "$root/tests/invariants.sh" "$fresh/hive-mind/tests/"
+fg() { GIT_CONFIG_GLOBAL=/dev/null git -C "$fresh" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false "$@"; }
+fg init -q && fg add -A && fg commit -qm "A new hive"
+sh "$fresh/hive-mind/tests/invariants.sh" >"$tmp/fresh.out" 2>&1 \
+    && ok "the daily check passes on a hive just made from the template" || { fail "the daily check passes on a hive just made from the template"; grep '^FAIL' "$tmp/fresh.out" | sed 's/^/     /'; }
+
 # bin/hive against throwaway machines, under this system's sh and under bash --posix, which is what
 # /bin/sh is on macOS.
 sh "$root/tests/hive.test.sh" >"$tmp/hive.log" 2>&1 && ok "hive scenarios ($(grep -c '^ok' "$tmp/hive.log") checks)" || { fail "hive scenarios"; sed 's/^/     /' "$tmp/hive.log"; }
