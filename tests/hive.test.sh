@@ -1,9 +1,11 @@
 #!/bin/sh
 # Scenarios for bin/hive against a throwaway hive remote, two source remotes (the core and a collection
 # of skills) and throwaway machines (a, b, c and more), each with its own home and Claude config
-# directory. The core is built from this working tree, so uncommitted changes are what gets tested. The
-# hive is built from template/ with fixtures added, or from the hive checkout HIVE_TEST_HIVE names, as a
-# hive's own CI runs this. Prints ok or FAIL per check; the exit code is the number of failures.
+# directory. The core is built from this working tree, so uncommitted changes are what gets tested, and
+# the hive from template/ with fixtures added. Prints ok or FAIL per check; the exit code is the number of
+# failures.
+# Checks are strings that check() evals, helpers run only from them, and `test && ok || fail` is the idiom:
+# shellcheck disable=SC2015,SC2016,SC2012,SC2034,SC2329
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -51,10 +53,8 @@ bare "$tmp/extras-src" extras
 
 # The hive's remote. Real machines' usage records and rule costs would count in the throwaway machines'
 # reports, and real tidy logs would decide when the throwaway machines' tidies are due.
-hive_src=${HIVE_TEST_HIVE:-$root/template}
+hive_src=$root/template
 snapshot "$hive_src" "$tmp/src"
-pins_of() { awk '!/^[[:space:]]*(#|$)/ && NF == 3 { print $1 }' "$1" 2>/dev/null; }
-for s in $(pins_of "$tmp/src/hive.lock"); do rm -rf "${tmp:?}/src/$s"; done
 rm -rf "$tmp/src/memory/.usage" "$tmp/src/memory/.costs" "$tmp/src/decisions/tidy"
 mkdir -p "$tmp/src/instructions" "$tmp/src/memory"
 printf '## Test instructions\n\nA fixture.\n' >"$tmp/src/instructions/test.md"
@@ -1135,6 +1135,19 @@ git clone -q "$tmp/rt-m2.git" "$tmp/rt-m2-pr" &&
 new_extras rt-two >/dev/null
 run rm2 upgrade >/dev/null 2>&1
 check "an upgrade replayed onto a lock that moved the source keeps its new URL" "git --git-dir='$tmp/rt-m2.git' show main:hive.lock | grep -q '^extras $tmp/extras-fork.git '"
+
+# The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
+git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
+machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
+cf_head=$(git -C "$tmp/cf/hive" rev-parse HEAD)
+git clone -q "$tmp/rt-core.git" "$tmp/rt-core-pr" &&
+    awk '$1 == "hive-mind" { core = $0; next } { print } END { print core }' "$tmp/rt-core-pr/hive.lock" >"$tmp/rt-lock" &&
+    mv "$tmp/rt-lock" "$tmp/rt-core-pr/hive.lock" && git -C "$tmp/rt-core-pr" commit -qam "core last" && git -C "$tmp/rt-core-pr" push -q origin main
+out=$(run cf sync 2>&1); rc=$?
+check "a lock that does not pin the core first fails the sync, saying so" "[ $rc != 0 ] && printf '%s' \"\$out\" | grep -q 'hive.lock must pin the core first, named hive-mind' && [ \"\$(git -C '$tmp/cf/hive' rev-parse HEAD)\" = '$cf_head' ]"
+machine cs && mv "$tmp/cs/hive/hive-mind" "$tmp/cs/hive/core"
+out=$(HOME="$tmp/cs/home" CLAUDE_CONFIG_DIR="$tmp/cs/cfg" "$tmp/cs/hive/core/bin/hive" status 2>&1)
+check "status flags a core that runs from another clone than hive-mind" "printf '%s' \"\$out\" | grep -q '^  fix   hive.lock must pin the core first.*runs from $tmp/cs/hive/core'"
 
 # --- uninstall ------------------------------------------------------------------------------------
 

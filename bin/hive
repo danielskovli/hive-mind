@@ -469,12 +469,20 @@ EOF
 
 # --- sources ----------------------------------------------------------------------------------------
 
-# Prints the sources a commit's hive.lock pins, "<name> <url> <commit>" a line, in the lock's order:
-# HEAD, any commit, or - for the working tree's. A line that is not that shape, or names a folder the
-# hive itself uses, is left out (`hive status` lists it), so a hand-edited lock cannot reach outside the
-# hive or over its content.
+# Prints the sources a commit's hive.lock pins, "<name> <url> <commit>" a line, in the lock's order. A
+# line that is not that shape, or names a folder the hive itself uses, is left out (`hive status` lists
+# it), so a hand-edited lock cannot reach outside the hive or over its content.
 pins() {
-    if [ "${1:--}" = - ]; then cat "$lockpins" 2>/dev/null; else g show "$1:hive.lock" 2>/dev/null; fi | pin_lines valid
+    g show "$1:hive.lock" 2>/dev/null | pin_lines valid
+}
+
+# Prints what is wrong, if anything, with where the lock <list> puts the core: it must name the core
+# first, as hive-mind, and this script must run from that clone, since every machine finds its engine
+# at <hive>/hive-mind and sync moves the clone it runs.
+core_problem() {
+    first=$(printf '%s\n' "$1" | awk 'NF { print $1; exit }')
+    [ "$first" = hive-mind ] && [ "$core" = "$hive/hive-mind" ] && return 0
+    echo "hive.lock must pin the core first, named hive-mind, and this script must run from $hive/hive-mind; the lock pins ${first:-nothing} first, and this script runs from $core"
 }
 # pin_lines valid|invalid: the lock's lines that are (or are not) a source, comments and blanks aside.
 pin_lines() {
@@ -500,6 +508,11 @@ exclude_source() {
 # Fails at the first source it cannot get, naming it.
 sources_fetch() {
     list=$(pins "$1")
+    problem=$(core_problem "$list")
+    if [ -n "$problem" ]; then
+        fail_with "$problem"
+        return 1
+    fi
     while read -r name url sha; do
         [ -n "$name" ] || continue
         dir="$hive/$name"
@@ -516,6 +529,11 @@ sources_fetch() {
                 return 1
             fi
             exclude_source "$name"
+        fi
+        # The lock's URL is where the source lives now (a fork, a moved repository), whatever the clone
+        # was made from.
+        if [ "$(gitc -C "$dir" remote get-url origin 2>/dev/null)" != "$url" ]; then
+            gitc -C "$dir" remote set-url origin "$url" 2>/dev/null || gitc -C "$dir" remote add origin "$url"
         fi
         gitc -C "$dir" cat-file -e "$sha^{commit}" 2>/dev/null && continue
         # A pinned commit by name, which GitHub serves; else everything, for a server that does not.
@@ -779,16 +797,19 @@ move_live() {
 resolve() {
     case "$1" in
         hive.lock)
-            # Per source: the replayed commit's pin where it moved one, else upstream's. Two machines
-            # upgrading different sources both land; of two upgrades of one source, the replayed wins.
+            # Upstream's lock, line for line, but for one case: a source upstream left as it was (same
+            # URL as the base), which the replayed commit pinned elsewhere at that URL, takes the
+            # replayed pin. Replayed commits come from `upgrade`, which only moves pins: so two
+            # machines upgrading different sources both land, of two upgrades of one source the
+            # replayed wins, and a source upstream removed or moved stays as upstream has it.
             d=$(mktemp -d)
             w show ":1:$1" >"$d/base" 2>/dev/null || : >"$d/base"
             w show ":2:$1" >"$d/ours" 2>/dev/null || : >"$d/ours"
             w show ":3:$1" >"$d/theirs" 2>/dev/null || : >"$d/theirs"
-            awk 'FILENAME == ARGV[1] { if (NF == 3) b[$1] = $3; next }
-                 FILENAME == ARGV[2] { if (NF == 3 && $1 !~ /^#/ && b[$1] != $3) { t[$1] = $0; o[++n] = $1 }; next }
-                 { if (NF == 3 && ($1 in t)) { print t[$1]; delete t[$1] } else print }
-                 END { for (i = 1; i <= n; i++) if (o[i] in t) print t[o[i]] }' "$d/base" "$d/theirs" "$d/ours" >"$wt/$1"
+            awk 'FILENAME == ARGV[1] { if (NF == 3) { bu[$1] = $2; bs[$1] = $3 }; next }
+                 FILENAME == ARGV[2] { if (NF == 3) { tu[$1] = $2; ts[$1] = $3; t[$1] = $0 }; next }
+                 NF == 3 && $1 !~ /^#/ && ($1 in bu) && ($1 in tu) && bu[$1] == $2 && tu[$1] == $2 && ts[$1] != bs[$1] { print t[$1]; next }
+                 { print }' "$d/base" "$d/theirs" "$d/ours" >"$wt/$1"
             w add -- "$1"
             rm -rf "$d"
             return 0 ;;
@@ -987,9 +1008,18 @@ EOF
     [ "$mode" = check ] && return 0
     for l in "$cfg"/skills/* "$cfg"/rules/*; do
         [ -L "$l" ] || continue
-        case "$(readlink "$l")" in
-            "$hive"/*) [ -e "$l" ] || { rm "$l"; [ "$mode" = report ] && say "removed stale link $l"; } ;;
-        esac
+        t=$(readlink "$l")
+        case "$t" in "$hive"/*) ;; *) continue ;; esac
+        # A link to nothing, or into a clone hive.lock no longer pins (the clone stays on disk).
+        top=${t#"$hive"/}
+        top=${top%%/*}
+        if [ ! -e "$l" ]; then
+            rm "$l"
+            [ "$mode" = report ] && say "removed stale link $l"
+        elif [ -e "$hive/$top/.git" ] && ! printf '%s\n' "$list" | grep -qxF "$hive/$top"; then
+            rm "$l"
+            [ "$mode" = report ] && say "removed $l: $top is no longer a source in hive.lock"
+        fi
     done
     return 0
 }
@@ -1861,6 +1891,8 @@ setup_checks() {
         elif [ -z "$at" ]; then line fix "source $name is missing: run $self sync"
         else line fix "source $name is at $(short "$at"), but hive.lock pins $(short "$sha"): run $self sync"; fi
     done
+    problem=$(core_problem "$(pins HEAD)")
+    [ -z "$problem" ] || line fix "$problem"
     bad=$(g show HEAD:hive.lock 2>/dev/null | pin_lines invalid | paste -sd'|' - | sed 's/|/ | /g')
     [ -z "$bad" ] || line fix "hive.lock has lines that are not \"<name> <url> <commit>\" (or name a folder the hive uses), and are ignored: $bad"
     if ! installed; then line fix "Claude Code settings do not use the hive: run $self install$missing"
@@ -1878,7 +1910,7 @@ setup_checks() {
     else line fix "$conflicts rule or skill link(s) missing or in the way: run $self install to see which"; fi
     dups=$(duplicated_sections "$cfg/CLAUDE.md")
     if [ -n "$dups" ]; then
-        line fix "$cfg/CLAUDE.md repeats hive sections, so they load twice: $dups (\"What goes where\")"
+        line fix "$cfg/CLAUDE.md repeats hive sections, so they load twice: $dups (\"A machine\", Then)"
     fi
     elsewhere=$(g status --porcelain --untracked-files=no | grep -v -e ' memory/' -e ' decisions/' -e ' worklog/' | cut -c4- | paste -sd' ' -)
     [ -z "$elsewhere" ] || line fix "uncommitted changes outside memory/, decisions/ and worklog/ stop incoming changes from landing: $elsewhere (change those by pull request)"
