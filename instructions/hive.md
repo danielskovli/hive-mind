@@ -22,6 +22,7 @@ you write down what you learn while you learn it.
 | Judgments, preferences and gotchas | `memory/` | write the file; the hooks push it |
 | A choice between alternatives for how we work, and why | `decisions/` | a new file |
 | What we are doing: tasks, plans, dates, handoffs | the Worklog, where the hive has one | its own instructions |
+| Claude Code settings the user wants on every machine | the hive's `settings.json` | pull request |
 | What any developer needs to work in a repository | that repository's `AGENTS.md` | pull request there |
 
 Knowledge moves upward: a memory that keeps proving itself becomes an instruction, a skill step or a

@@ -35,13 +35,14 @@ git clone -q "$1" ~/hive/hive-mind && git -C ~/hive/hive-mind checkout -q --deta
 
 - The other sources in `hive.lock`: each cloned into the hive at its pin, and kept out of its history.
 - `~/.claude/settings.json`: sets `autoMemoryDirectory` to `~/hive/memory`; turns off
-  `autoDreamEnabled` (Claude Code's own background consolidation, which the hive's tidy replaces),
-  `idleCompaction` (see "The keep-alive") and `awaySummaryEnabled` (the recap Claude Code writes into the
-  chat when you come back); blanks `attribution`, so commits and pull request descriptions name no model;
-  and adds hooks that run `~/hive/hive-mind/bin/hive`: sync at SessionStart, save at Stop and SessionEnd,
+  `autoDreamEnabled` (Claude Code's own background consolidation, which the hive's tidy replaces) and
+  `idleCompaction` (see "The keep-alive"); adds the keys of the hive's own `settings.json`, if it has
+  one (an object key by key; where it names one of the keys above, or `hooks`, the engine's value
+  stands); and adds hooks that run `~/hive/hive-mind/bin/hive`: sync at SessionStart, save at Stop and SessionEnd,
   the keep-alive at Stop, UserPromptSubmit and SessionEnd, and a PreToolUse guard that refuses edits to
   the hive outside `memory/`, `decisions/` and `worklog/`. Everything else in the file is kept, and a
-  linked settings file stays linked. Hooks of a hive cloned elsewhere are replaced.
+  linked settings file stays linked. Hooks of a hive cloned elsewhere are replaced. Uninstall takes back
+  the hive's keys that still hold its values.
 - `~/.claude/rules/hive-mind` and `~/.claude/rules/hive`: links to the core's and the hive's
   `instructions/`.
 - `~/.claude/skills/<name>`: a link per skill, from the highest layer that has it: in an agentctl
@@ -59,8 +60,7 @@ Every Claude Code session on the machine, in any directory, now uses the hive's 
 checkout on `main`; work on the hive itself in a worktree (see "Changing instructions, skills and
 sources" in `instructions/hive.md`).
 
-You install once. When a new core changes what `install` writes to the settings, the next sync brings
-the hive's keys and hooks up to it, through the core it has just checked out, and logs what changed.
+You install once. When a new core or the hive's own keys change what `install` writes to the settings, or you change one of those keys by hand, the next sync brings them back, through the core it has just checked out, and logs what changed.
 Links are made by `install`, and by every sync for skills that arrive. In an agentctl sandbox, sync
 leaves the settings alone: agentd puts the agent's home over them (see "agentctl").
 
@@ -105,7 +105,7 @@ metadata:
   name: <the agent's name, as in agent.yaml>
 spec:
   home:
-    source: ~/hive/hive-mind/sandbox/home
+    source: ~/hive/sandbox/home
   instructions:
     - source: ~/hive/sandbox/host-instructions.md
     - source: instructions.md
@@ -116,7 +116,8 @@ the manifest's instruction files again. agentd reads the files on every pass, so
 a change within a minute.
 
 `home` replaces the agent's own home overlay whole, and agentd copies it over `/home/agent` every 30
-seconds, so the hive's settings stay put (`sandbox/README.md`). agentctl refuses to change an existing
+seconds, so the hive's settings stay put (`sandbox/README.md`). `hive install` and every sync on this
+machine write that home, outside the hive's history. agentctl refuses to change an existing
 agent's home, so delete the agent and apply it again.
 
 For each agent:
