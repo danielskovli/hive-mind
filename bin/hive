@@ -1,0 +1,1749 @@
+#!/bin/sh
+# Keeps this machine's Claude Code in step with the hive checkout this script lives in.
+#
+#   hive install [--force]     wire Claude Code to this checkout (settings, rules, skills, index),
+#                               and put `hive` on the PATH through ~/.local/bin
+#   hive uninstall             undo install; the checkout and its memory stay
+#   hive sync [--hook]         commit local memory, merge with origin, push, relink, rebuild index,
+#                               and run `settings`
+#   hive settings              bring the hive's keys in Claude Code's settings up to what this
+#                               checkout installs, where install has run; never in a sandbox
+#   hive save [--background]   commit memory/, decisions/ and worklog/ and push them
+#   hive index                 rebuild memory/MEMORY.md from the memory files' frontmatter
+#   hive guard                 PreToolUse hook: refuse edits to the checkout outside memory/,
+#                               decisions/ and worklog/
+#   hive tidy [--auto]         run the consolidate-hive skill's tidy now, in a headless Claude
+#                               session; --auto (from the session-start hook) only when it is due
+#   hive shape                 print the memory files' shape, as a tidy records it
+#   hive usage [days]          which memories sessions opened in the last 30 (or [days]) days, on
+#                               every machine; brings this machine's records up to date first
+#   hive cost <rule> <text>    log for the retro what following a rule cost, or why a default did
+#                               not fit; <rule> is a memory's name, instructions/<file> or skills/<name>
+#   hive costs [days]          what was logged in the last 30 (or [days]) days, on every machine
+#   hive status                this checkout against origin, the install, and the last error
+#   hive keepalive stop|prompt|end
+#                               hooks that keep an idle session's prompt cache warm (see keep-alive)
+#
+# `install` adds hooks to Claude Code's user settings: SessionStart runs `sync --hook`, Stop and
+# SessionEnd run `save --background`, PreToolUse runs `guard`, and Stop, UserPromptSubmit and
+# SessionEnd run `keepalive`. SessionStart output lands in the session's context, so in hook mode sync
+# prints nothing unless the session needs to know something.
+#
+# Only memory/, decisions/ and worklog/ (a backup of the Worklog artifact) are ever committed here.
+# Everything else changes by pull request.
+#
+# Many sessions write at once, on one machine and on many. None of them ever waits on another or loses
+# a write: commits are local and serialised per checkout; local commits are rebased onto origin in a
+# private worktree, never in the checkout sessions read; a conflict in memory/ or decisions/ keeps both
+# versions in the file for the consolidation pass to reconcile (combine below); an edit beats a delete;
+# and the checkout is moved with `git reset --keep`, which refuses rather than overwrite a file a
+# session has changed and not yet committed.
+#
+# CLAUDE_CONFIG_DIR overrides ~/.claude. Runs under any POSIX sh, on Linux and macOS.
+set -eu
+
+# Follow links to this script, so `hive` on the PATH, a link to here, finds its checkout.
+script=$0
+while [ -L "$script" ]; do
+    target=$(readlink "$script")
+    case "$target" in
+        /*) script=$target ;;
+        *) script=$(dirname "$script")/$target ;;
+    esac
+done
+hive=$(cd "$(dirname "$script")/.." && pwd -P)
+self="$hive/bin/hive"
+cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+branch=main
+start_marker='<!-- hive:workflow:start -->'
+end_marker='<!-- hive:workflow:end -->'
+
+# Every git call runs insulated from the user's own git setup: paths unquoted (names may be non-ASCII),
+# no signing prompt on each turn, no user hooks. A machine with no identity gets a neutral one.
+gitc() { git -c core.quotePath=false -c commit.gpgSign=false -c core.hooksPath=/dev/null "$@"; }
+g() { gitc -C "$hive" "$@"; }
+if ! git -C "$hive" config user.email >/dev/null 2>&1 && [ -z "${GIT_AUTHOR_EMAIL:-}" ]; then
+    export GIT_AUTHOR_NAME=hive GIT_AUTHOR_EMAIL=hive@localhost
+    export GIT_COMMITTER_NAME=hive GIT_COMMITTER_EMAIL=hive@localhost
+fi
+# Network operations give up quickly instead of hanging a session start on a dead connection.
+gnet() {
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+        gitc -C "$hive" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 "$@"
+}
+say() { printf 'hive: %s\n' "$*"; }
+die() { say "$*" >&2; exit 1; }
+
+g rev-parse --git-dir >/dev/null 2>&1 || die "$hive is not a git checkout"
+state="$(g rev-parse --absolute-git-dir)/hive"
+mkdir -p "$state"
+log="$state/log"
+wt="$state/worktree"
+w() { gitc -C "$wt" "$@"; }
+hook=0
+incoming="$state/incoming.$$"
+
+logline() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$log"; }
+fail_with() { printf '%s\n' "$*" >"$state/error"; logline "error: $*"; }
+
+# One writer at a time per checkout: several sessions on one machine share it. The lock is a file made
+# with the shell's noclobber (O_EXCL), which is atomic where mkdir is not: uutils mkdir, Ubuntu 26.04's
+# default, lets two callers win. It holds its owner's pid and a token. A lock whose owner is gone is
+# broken by whoever wins a second noclobber file, so two waiters never both break it, and unlock only
+# ever removes the lock it took.
+lockfile="$state/lock"
+token="$$-$(date +%s)-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')"
+held=0
+take_lock() { ( set -C; printf '%s\n' "$token" >"$lockfile" ) 2>/dev/null; }
+break_stale() {
+    stale=$(cat "$lockfile" 2>/dev/null) || return 0
+    pid=${stale%%-*}
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -z "$(find "$lockfile" -mmin +30 2>/dev/null)" ]; then
+        return 0
+    fi
+    if ( set -C; printf '%s\n' "$token" >"$lockfile.break" ) 2>/dev/null; then
+        if [ "$(cat "$lockfile" 2>/dev/null)" = "$stale" ]; then
+            rm -f "$lockfile"
+            logline "broke the lock of $stale, whose owner is gone"
+        fi
+        rm -f "$lockfile.break"
+    elif [ -n "$(find "$lockfile.break" -mmin +1 2>/dev/null)" ]; then
+        rm -f "$lockfile.break"
+    fi
+}
+hold() {
+    held=1
+    trap 'unlock' EXIT
+    trap 'unlock; exit 130' INT
+    trap 'unlock; exit 143' TERM
+}
+lock() { # [seconds to wait]
+    tries=0
+    until take_lock; do
+        break_stale
+        tries=$((tries + 1))
+        [ "$tries" -lt $((${1:-20} * 5)) ] || return 1
+        sleep 0.2
+    done
+    hold
+}
+trylock() {
+    take_lock || { break_stale; take_lock; } || return 1
+    hold
+}
+unlock() {
+    [ "$held" = 1 ] || return 0
+    [ "$(cat "$lockfile" 2>/dev/null)" = "$token" ] && rm -f "$lockfile"
+    held=0
+    trap - EXIT INT TERM
+}
+
+current_branch() { g symbolic-ref --short -q HEAD || echo "(detached)"; }
+
+# Memory is committed only on main: a checkout someone switched to a branch keeps it uncommitted until
+# it is back.
+on_main() {
+    b=$(current_branch)
+    [ "$b" = "$branch" ] && return 0
+    fail_with "checkout is on $b, not $branch; not syncing (use a worktree for branch work)"
+    return 1
+}
+
+# --- memory index -----------------------------------------------------------------------------------
+
+# Claude Code loads only the first 200 lines and 25,000 characters of MEMORY.md (2.1.309), and asks
+# for entries under about 200 characters. The index stays inside a smaller budget so nothing is cut
+# silently; past it, the last line says how many memories are not listed. A tidy becomes due at 90% of
+# it, counted in bytes, which never undercount Claude Code's characters.
+index_line_max=180
+index_lines_max=170
+index_chars_max=22000
+
+# Prints index lines for the given memory files, one awk pass for all of them, MEMORY.md and retired
+# memories skipped: "<type>\t- [name](file) — description (date)", at most $index_line_max characters.
+# A feedback memory with `firmness: rule` has the type "rule", so the index lists rules apart.
+entries() {
+    awk -v max="$index_line_max" '
+        function flush(   head, tail, room) {
+            if (file == "" || file == "MEMORY.md" || retired) return
+            gsub(/^"|"$/, "", desc); gsub(/\\"/, "\"", desc); gsub(/^"|"$/, "", name)
+            if (name == "") name = file
+            if (type !~ /^(feedback|user|project|reference)$/) type = "other"
+            if (type == "feedback" && firmness == "rule") type = "rule"
+            head = "- [" name "](" file ") — "
+            tail = (date != "" ? " (" date ")" : "") (sibling ? " [2 versions]" : "")
+            room = max - length(head) - length(tail)
+            # Cut at a space: some awks count bytes, and a cut inside a character would break it.
+            if (length(desc) > room) { desc = substr(desc, 1, (room > 4 ? room - 4 : 0)); sub(/ [^ ]*$/, "", desc); desc = desc "…" }
+            printf "%s\t%s%s%s\n", type, head, desc, tail
+        }
+        FNR == 1 {
+            flush()
+            file = FILENAME; sub(/.*\//, "", file)
+            name = desc = date = type = firmness = ""; sibling = retired = 0
+            infm = ($0 == "---"); next
+        }
+        infm && $0 == "---"             { infm = 0; next }
+        infm && /^name:/                { sub(/^name:[ \t]*/, ""); name = $0 }
+        infm && /^description:/         { sub(/^description:[ \t]*/, ""); desc = $0 }
+        infm && /^[ \t]+type:/          { sub(/^[ \t]+type:[ \t]*/, ""); type = $0 }
+        infm && /^[ \t]+date:/          { sub(/^[ \t]+date:[ \t]*/, ""); date = $0 }
+        infm && /^[ \t]+firmness:/      { sub(/^[ \t]+firmness:[ \t]*/, ""); gsub(/"|[ \t]+$/, ""); firmness = $0 }
+        infm && /^[ \t]+status:[ \t]*retired/ { retired = 1 }
+        !infm && /^<!-- hive:sibling/ { sibling = 1 }
+        END { flush() }
+    ' "$@"
+}
+
+# MEMORY.md is derived and git-ignored, so concurrent sessions never conflict over it.
+rebuild_index() {
+    dir="$hive/memory"
+    [ -d "$dir" ] || return 0
+    tmp=$(mktemp "$dir/.MEMORY.md.XXXXXX")
+    {
+        echo "# Memory index"
+        echo
+        echo "Generated from the files' frontmatter by \`hive index\`; edit the memory files, not this index."
+        set -- "$dir"/*.md
+        [ -f "$1" ] && entries "$@" | awk -F'\t' -v maxl="$index_lines_max" -v maxc="$index_chars_max" '
+            { n[$1]++; line[$1, n[$1]] = $2 }
+            END {
+                split("rule feedback user project reference other", order, " ")
+                title["rule"] = "Feedback: rules"
+                title["feedback"] = "Feedback: defaults (apply with judgment; say when you depart from one)"
+                title["user"] = "User"
+                title["project"] = "Project: lasting constraints"
+                title["reference"] = "Reference: where to look"; title["other"] = "Untyped"
+                used = 4; chars = 120; left = 0
+                for (i = 1; i <= 6; i++) {
+                    t = order[i]
+                    for (j = 1; j <= n[t]; j++) {
+                        if (left || used + 4 > maxl || chars + length(line[t, j]) + 80 > maxc) { left++; continue }
+                        if (j == 1 || !(t in shown)) { printf "\n## %s\n\n", title[t]; used += 3; chars += length(title[t]) + 6; shown[t] = 1 }
+                        print line[t, j]; used++; chars += length(line[t, j]) + 1
+                    }
+                }
+                if (left) printf "\n%d more memories are not listed: the index is over its budget, and the next tidy shrinks it. Search memory/ when you need one.\n", left
+            }'
+    } >"$tmp"
+    mv "$tmp" "$dir/MEMORY.md"
+}
+
+# --- memory usage -----------------------------------------------------------------------------------
+
+# Which memories sessions open, so the tidy and the retro can tell the memories that pull their weight
+# from the ones nobody reads. Transcripts never leave their machine, so each machine records its own in
+# memory/.usage/<machine>.tsv, a file no other machine writes: a line per session ("<date>\t-\t<session>")
+# and per memory a session or its subagents opened ("<date>\t<memory>\t<session>"). Opened is a Read of
+# the file or a shell command that reads it, in a session working outside the checkout: those inside it
+# are tidies, harvests and work on the hive. Records older than 180 days are dropped.
+usage_file() { printf '%s/memory/.usage/%s.tsv' "$hive" "$(machine_file)"; }
+# This machine's name as a file name, for the records only it writes.
+machine_file() { where | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]\{1,\}/-/g; s/^-//; s/-$//'; }
+
+# Brings this machine's usage file up to date from the transcripts changed since the last scan. Reading
+# a transcript again adds nothing twice.
+scan_usage() {
+    python3 -I - "$cfg/projects" "$hive" "$(usage_file)" "$state/usage-scanned" <<'EOF'
+import datetime, glob, json, os, re, sys, tempfile, time
+
+projects, hive, out, marker = sys.argv[1:5]
+hive = os.path.realpath(hive)
+memdir = os.path.join(hive, "memory")
+names = {f[:-3] for f in os.listdir(memdir) if f.endswith(".md") and f != "MEMORY.md"}
+start = time.time()
+since = os.path.getmtime(marker) - 3600 if os.path.exists(marker) else 0
+# A memory file named through the checkout's directory (~/hive/memory/x.md) or a $hive variable.
+ref = re.compile(r'(?:(?<![\w.-])' + re.escape(os.path.basename(hive)) + r'|\$\{?hive\}?"?)/memory/([\w.-]+)\.md')
+
+def inside(cwd):
+    p = os.path.realpath(cwd)
+    return p == hive or p.startswith(hive + os.sep)
+
+def opened(text, shell):
+    for m in ref.finditer(text):
+        if m.group(1) not in names:
+            continue
+        if shell:
+            # What precedes the path in its command: a redirect, or a command that writes or moves it.
+            head = re.sub(r'[^\s\'"<>|;&()]*$', "", text[:m.start()]).rstrip(" '\"")
+            words = re.split(r"[|;&\n]", head)[-1].split()
+            if head.endswith(">") or (words and (words[0] in ("tee", "mv", "cp", "rm", "touch")
+                                                 or (words[0] == "sed" and any(w.startswith("-i") for w in words)))):
+                continue
+        yield m.group(1)
+
+records = set()
+files = glob.glob(os.path.join(projects, "*", "*.jsonl")) + glob.glob(os.path.join(projects, "*", "*", "subagents", "*.jsonl"))
+for f in files:
+    try:
+        if os.path.getmtime(f) < since:
+            continue
+        fh = open(f, "rb")
+    except OSError:
+        continue
+    started = False
+    with fh:
+        for raw in fh:
+            hit = b"/memory/" in raw
+            if started and not hit:
+                continue
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(e, dict):
+                continue
+            sid, ts, cwd = e.get("sessionId"), e.get("timestamp"), e.get("cwd")
+            if not all(isinstance(v, str) and v for v in (sid, ts, cwd)):
+                continue
+            if not started:
+                started = True
+                if not inside(cwd):
+                    records.add((ts[:10], "-", sid))
+            if not hit or e.get("type") != "assistant" or inside(cwd):
+                continue
+            msg = e.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            for c in content if isinstance(content, list) else []:
+                if not isinstance(c, dict) or c.get("type") != "tool_use" or not isinstance(c.get("input"), dict):
+                    continue
+                if c.get("name") == "Read":
+                    text, shell = c["input"].get("file_path"), False
+                elif c.get("name") == "Bash":
+                    text, shell = c["input"].get("command"), True
+                else:
+                    continue
+                if isinstance(text, str):
+                    records.update((ts[:10], m, sid) for m in opened(text, shell))
+
+# Merged with what is recorded; a line that does not parse (a conflict the sync kept) is dropped.
+valid = re.compile(r"^\d{4}-\d{2}-\d{2}\t[\w.-]+\t[\w-]+$")
+try:
+    with open(out, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+except FileNotFoundError:
+    lines = []
+cutoff = (datetime.date.today() - datetime.timedelta(days=180)).isoformat()
+keep = sorted({"\t".join(r) for r in records} | {l for l in lines if valid.match(l)})
+keep = [l for l in keep if l[:10] >= cutoff]
+if keep != lines:
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), prefix=".tsv.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.writelines(l + "\n" for l in keep)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, out)
+open(marker, "a").close()
+os.utime(marker, (start, start))
+EOF
+}
+
+# Prints, for every memory in the index, how many sessions opened it in the last <days> days on every
+# machine, and when one last did.
+report_usage() {
+    python3 -I - "$hive" "$1" <<'EOF'
+import datetime, glob, os, re, sys
+
+hive, days = sys.argv[1], int(sys.argv[2])
+memdir = os.path.join(hive, "memory")
+since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+valid = re.compile(r"^\d{4}-\d{2}-\d{2}\t[\w.-]+\t[\w-]+$")
+machines = sorted(glob.glob(os.path.join(memdir, ".usage", "*.tsv")))
+started, opened, last = set(), {}, {}
+for f in machines:
+    with open(f, encoding="utf-8") as fh:
+        for line in fh.read().splitlines():
+            if not valid.match(line):
+                continue
+            day, name, sid = line.split("\t")
+            if name != "-":
+                last[name] = max(last.get(name, ""), day)
+            if day >= since:
+                (started.add(sid) if name == "-" else opened.setdefault(name, set()).add(sid))
+memories = {}
+for f in glob.glob(os.path.join(memdir, "*.md")):
+    name = os.path.basename(f)[:-3]
+    with open(f, encoding="utf-8") as fh:
+        text = fh.read()
+    head = text.split("\n---", 1)[0] if text.startswith("---") else ""
+    if name == "MEMORY" or re.search(r"^\s+status:\s*retired", head, re.M):
+        continue
+    date = re.search(r"^\s+date:\s*(\S+)", head, re.M)
+    memories[name] = date.group(1) if date else "-"
+readers = set().union(*(opened.get(n, set()) for n in memories))
+print(f"Memories opened in the last {days} days, recorded on {len(machines)} machine(s): "
+      f"{len(started)} sessions started, {len(readers)} sessions opened at least one.")
+print("Sessions  Last opened  Dated       Memory")
+for name in sorted(memories, key=lambda n: (-len(opened.get(n, ())), n)):
+    print(f"{len(opened.get(name, ())):8d}  {last.get(name, '-'):11s}  {memories[name]:10s}  {name}")
+EOF
+}
+
+# --- rule costs -------------------------------------------------------------------------------------
+
+# What following a rule cost in one case, or why a default did not fit, in the words of the session that
+# met it, for the user's retro to weigh. As with usage, each machine writes only its own
+# memory/.costs/<machine>.tsv, a line per entry ("<date>\t<rule>\t<session>\t<text>"). No session reads
+# them; the retro does, through `hive costs`.
+cmd_cost() {
+    [ $# -eq 2 ] || die 'usage: hive cost <rule> "<context>: <what it cost>"'
+    rule=$(cost_rule "$1") ||
+        die "not a rule in the hive: $1 (give a memory's name, instructions/<file>.md or skills/<name>)"
+    text=$(printf '%s' "$2" | tr '\t\r\n' '   ' | sed 's/^ *//; s/ *$//')
+    [ -n "$text" ] || die "say in what context the rule cost something, and what"
+    file="$hive/memory/.costs/$(machine_file).tsv"
+    mkdir -p "$(dirname "$file")"
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%d)" "$rule" "${CLAUDE_CODE_SESSION_ID:--}" "$text" >>"$file"
+    say "logged against $rule for the retro; the end of the turn pushes it"
+}
+
+# Prints the rule a name refers to, as the log records it: a memory by its file name (its `name:` works
+# too), instructions/<file>.md or skills/<name>. Fails for anything else.
+cost_rule() {
+    case "$1" in ''|*[!A-Za-z0-9._/-]*|*..*|/*) return 1 ;; esac
+    case "$1" in
+        instructions/*) r=${1%.md}.md; [ -f "$hive/$r" ] ;;
+        skills/*) r=${1%/}; r=${r%/SKILL.md}; [ -f "$hive/$r/SKILL.md" ] ;;
+        */*) return 1 ;;
+        *)
+            r=${1%.md}
+            if [ ! -f "$hive/memory/$r.md" ]; then
+                f=$(grep -l -x "name: *\"\{0,1\}$r\"\{0,1\} *" "$hive"/memory/*.md 2>/dev/null | head -n 1)
+                [ -n "$f" ] || return 1
+                r=$(basename "$f" .md)
+            fi
+            [ "$r" != MEMORY ] ;;
+    esac && printf '%s\n' "$r"
+}
+
+# Prints the entries of the last <days> days on every machine, by rule, the most logged against first;
+# a memory shows whether it is a rule, a default or retired.
+cmd_costs() {
+    case "${1:-30}" in ''|*[!0-9]*) die "usage: hive costs [days]" ;; esac
+    python3 -I - "$hive" "${1:-30}" <<'EOF'
+import datetime, glob, os, re, sys
+
+hive, days = sys.argv[1], int(sys.argv[2])
+since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+valid = re.compile(r"^(\d{4}-\d{2}-\d{2})\t([\w./-]+)\t([\w-]+)\t(.+)$")
+files = sorted(glob.glob(os.path.join(hive, "memory", ".costs", "*.tsv")))
+entries = {}
+for f in files:
+    machine = os.path.basename(f)[:-4]
+    with open(f, encoding="utf-8") as fh:
+        for line in fh.read().splitlines():
+            m = valid.match(line)
+            if m and m.group(1) >= since:
+                day, rule, sid, text = m.groups()
+                entries.setdefault(rule, []).append((day, machine, sid[:8], text))
+
+def kind(rule):
+    try:
+        with open(os.path.join(hive, "memory", rule + ".md"), encoding="utf-8") as fh:
+            head = fh.read().split("\n---", 1)[0]
+    except OSError:
+        return ""
+    if re.search(r"^\s+status:\s*retired", head, re.M):
+        return " (retired)"
+    firmness = re.search(r"^\s+firmness:\s*(\w+)", head, re.M)
+    return f" ({firmness.group(1)})" if firmness else ""
+
+print(f"Rule costs logged in the last {days} days, on {len(files)} machine(s): "
+      f"{sum(map(len, entries.values()))} against {len(entries)} rule(s).")
+for rule in sorted(entries, key=lambda r: (-len(entries[r]), r)):
+    print(f"\n{rule}{kind(rule)}")
+    for day, machine, sid, text in sorted(entries[rule], reverse=True):
+        print(f"  {day}  {machine}  {sid}  {text}")
+EOF
+}
+
+# --- commit and exchange ----------------------------------------------------------------------------
+
+where() {
+    if [ -n "${AGENT_NAME:-}" ]; then echo "agentctl:$AGENT_NAME on ${AGENT_HOST:-unknown host}"
+    else hostname -s 2>/dev/null || hostname; fi
+}
+
+# Commits whatever changed under memory/, decisions/ and worklog/, and nothing else: an instruction
+# being edited in the same checkout stays out of the commit, staged or not.
+commit_local() {
+    [ -n "$(g status --porcelain -- memory decisions worklog)" ] || return 0
+    # An index lock this old is a crashed git's, and would fail every commit from now on.
+    if [ -n "$(find "$(g rev-parse --absolute-git-dir)/index.lock" -mmin +10 2>/dev/null)" ]; then
+        rm -f "$(g rev-parse --absolute-git-dir)/index.lock"
+        logline "removed an index.lock older than ten minutes"
+    fi
+    g add -A -- memory decisions worklog
+    screen_secrets
+    screen_case
+    guard_worklog_shrink
+    changes=$(g diff --cached --name-status -- memory decisions worklog)
+    [ -n "$changes" ] || return 0
+    subject=$(printf '%s\n' "$changes" | awk -F'\t' '
+        { dir = $NF; sub(/\/.*/, "", dir); name = $NF; sub(/^[^\/]*\//, "", name); sub(/\.md$/, "", name)
+          verb = ($1 == "A") ? "add" : ($1 == "D") ? "remove" : "update"
+          key = dir ": " verb; if (!(key in seen)) { order[++n] = key; seen[key] = name } else seen[key] = seen[key] ", " name
+          count[key]++ }
+        END { for (i = 1; i <= n; i++) printf "%s%s %s", (i > 1 ? "; " : ""), order[i],
+                  (count[order[i]] > 5 ? count[order[i]] " files" : seen[order[i]]) }')
+    [ "${#subject}" -le 100 ] || subject="$(printf '%s' "$subject" | cut -c1-96) …"
+    g commit -q --no-verify -m "$subject" \
+        -m "Hive-Host: $(where)
+Hive-Session: ${CLAUDE_CODE_SESSION_ID:-none}" -- memory decisions worklog
+}
+
+# What reaches GitHub within the turn must not hold a secret. A staged file whose added lines match a
+# well-known credential shape stays out of the commit, and the error says which.
+secret_shapes='ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gh[osu]_[A-Za-z0-9]{30,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+screen_secrets() {
+    g diff --cached --name-only --diff-filter=AM -- memory decisions worklog >"$state/staged"
+    while IFS= read -r f; do
+        if g diff --cached -U0 -- "$f" | grep '^+' | grep -Eq "$secret_shapes"; then
+            g reset -q -- "$f"
+            fail_with "not committed: $f looks like it holds a secret; remove it and say where the secret lives instead"
+        fi
+    done <"$state/staged"
+}
+
+# Two memories whose names differ only in case are one file on a Mac's file system, which would push
+# one's content over the other. A new one like that stays out of the commit.
+screen_case() {
+    g diff --cached --name-only --diff-filter=A -- memory decisions >"$state/staged"
+    while IFS= read -r f; do
+        lower=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')
+        if g ls-files -- memory decisions | grep -vxF "$f" | tr '[:upper:]' '[:lower:]' | grep -qxF "$lower"; then
+            g reset -q -- "$f"
+            fail_with "not committed: $f differs only in case from an existing file; write to that one instead"
+        fi
+    done <"$state/staged"
+}
+
+# A refresh of the Worklog backup that came back mostly empty (the Worklog gone, a read that failed)
+# must not replace the backup it exists to provide.
+guard_worklog_shrink() {
+    before=$(g ls-tree -r --name-only HEAD -- worklog/data 2>/dev/null | grep -c '\.json$' || true)
+    after=$(g ls-files -- worklog/data | grep -c '\.json$' || true)
+    if [ "$before" -ge 20 ] && [ "$after" -lt $((before / 2)) ]; then
+        g reset -q -- worklog
+        fail_with "not committed: the Worklog backup would shrink from $before to $after documents. If the Worklog really shrank that much, commit worklog/ by hand; otherwise restore it with git checkout -- worklog"
+    fi
+}
+
+# Brings local commits and origin together and pushes the result, then moves the live checkout. A push
+# that lost a race to another machine is retried (with a growing pause, except at a session start);
+# any other failure is not. On failure the reason is in $state/error and local commits stay, unpushed,
+# for the next attempt.
+#
+# $state/pushed names a local commit whose changes are already on origin although the checkout could
+# not move there (see move_live): only commits after it are replayed, so nothing is combined twice.
+exchange() {
+    attempt=0
+    max=5
+    [ "$hook" = 1 ] && max=2
+    while :; do
+        attempt=$((attempt + 1))
+        if ! gnet fetch -q origin "$branch" 2>"$state/err"; then
+            fail_with "fetch failed: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+            return 1
+        fi
+        here=$(g rev-parse HEAD)
+        there=$(g rev-parse "origin/$branch")
+        base=$(g merge-base "$here" "$there")
+        pushed=$(cat "$state/pushed" 2>/dev/null || true)
+        if [ -n "$pushed" ] && ! g merge-base --is-ancestor "$pushed" "$here" 2>/dev/null; then pushed=""; fi
+        # What other machines added that this checkout does not have on disk, for the hook's report.
+        g diff --name-status "$base" "$there" -- memory instructions skills >>"$incoming" 2>/dev/null || true
+        if [ "$here" = "$there" ] || [ "$here" = "$base" ] || [ "$here" = "$pushed" ]; then
+            target=$there
+        elif [ -n "$pushed" ]; then
+            target=$(rebase_privately "$here" "$there" "$pushed") || return 1
+        elif [ "$there" = "$base" ]; then
+            target=$here
+        else
+            target=$(rebase_privately "$here" "$there" "$base") || return 1
+        fi
+        if [ "$target" = "$there" ] || gnet push -q origin "$target:refs/heads/$branch" 2>"$state/err"; then
+            break
+        fi
+        cat "$state/err" >>"$log"
+        if ! grep -q -e 'non-fast-forward' -e 'fetch first' "$state/err" || [ "$attempt" -ge "$max" ]; then
+            fail_with "push failed: $(grep -v -e '^hint:' -e '^To ' "$state/err" | head -n 3 | paste -sd' ' -)"
+            return 1
+        fi
+        [ "$hook" = 1 ] || sleep "$attempt"
+    done
+    rm -f "$state/error"
+    move_live "$target" "$here"
+}
+
+# Prepares the private worktree at <commit>. Only this script uses it, and only while holding the lock,
+# so a leftover index lock or rebase there is a crashed run's, and is cleared.
+worktree_at() {
+    if ! w rev-parse -q --verify HEAD >/dev/null 2>&1; then
+        rm -rf "$wt"
+        g worktree prune
+        if ! g worktree add -q --detach "$wt" "$1" >/dev/null 2>"$state/err"; then
+            fail_with "could not create $wt: $(tail -n 1 "$state/err")"
+            return 1
+        fi
+    fi
+    rm -f "$(w rev-parse --absolute-git-dir)/index.lock"
+    if rebasing; then w rebase --abort >/dev/null 2>&1 || true; fi
+    if w checkout -q -f --detach "$1" >/dev/null 2>"$state/err" && w clean -qfd >/dev/null 2>&1 \
+        && [ "$(w rev-parse HEAD)" = "$(g rev-parse "$1")" ]; then
+        return 0
+    fi
+    fail_with "could not prepare $wt at $1: $(tail -n 1 "$state/err")"
+    return 1
+}
+rebasing() { [ -d "$(w rev-parse --absolute-git-dir)/rebase-merge" ] || [ -d "$(w rev-parse --absolute-git-dir)/rebase-apply" ]; }
+
+# Replays the local commits after <base> onto <upstream>, starting from <local>, in the private
+# worktree, and prints the result. Sessions never see a half-rebased tree, and a conflict never stops
+# the rebase: both versions of a file are combined, and an edit beats a delete. Only a conflict outside
+# memory/, decisions/ and worklog/ fails, and local commits never touch anything else. The result must
+# contain <upstream>; anything else is a rebase that did not happen, and is never pushed.
+rebase_privately() {
+    worktree_at "$1" || return 1
+    GIT_EDITOR=true w rebase -q --onto "$2" "$3" >/dev/null 2>&1 || true
+    rounds=0
+    while rebasing; do
+        rounds=$((rounds + 1))
+        if [ "$rounds" -gt 200 ]; then
+            w rebase --abort >/dev/null 2>&1
+            fail_with "rebase did not finish after 200 steps; nothing pushed"
+            return 1
+        fi
+        w diff --name-only --diff-filter=U >"$state/unmerged"
+        while IFS= read -r p; do
+            case "$p" in
+                memory/*|decisions/*|worklog/*) resolve "$p" ;;
+                *)
+                    w rebase --abort >/dev/null 2>&1
+                    fail_with "conflict in $p, outside memory/, decisions/ and worklog/; nothing pushed"
+                    return 1 ;;
+            esac
+        done <"$state/unmerged"
+        if w diff --cached --quiet; then
+            GIT_EDITOR=true w rebase --skip >/dev/null 2>&1 || true
+        else
+            GIT_EDITOR=true w rebase --continue >/dev/null 2>&1 || true
+        fi
+    done
+    result=$(w rev-parse HEAD)
+    if ! w merge-base --is-ancestor "$2" "$result"; then
+        fail_with "the rebase onto origin did not complete; nothing pushed"
+        return 1
+    fi
+    echo "$result"
+}
+
+# Moves the live checkout from <expected> to <commit>, touching only files that differ and refusing,
+# without changing anything, when one of those has uncommitted changes: a session writing at that
+# moment, or someone editing outside memory/. Either way <expected> is pushed already; recording it in
+# $state/pushed keeps the next sync from replaying it. A commit someone made by hand meanwhile is left
+# for the next sync too, rather than orphaned.
+move_live() {
+    current=$(g rev-parse HEAD)
+    if [ "$current" = "$1" ]; then rm -f "$state/pushed"; return 0; fi
+    if [ "$current" != "$2" ]; then
+        g merge-base --is-ancestor "$2" "$current" && printf '%s\n' "$2" >"$state/pushed"
+        logline "checkout moved to $(g rev-parse --short HEAD) during the sync; the next sync takes it in"
+        return 0
+    fi
+    if ! g reset -q --keep "$1" 2>"$state/err"; then
+        printf '%s\n' "$2" >"$state/pushed"
+        blocked=$(g status --porcelain --untracked-files=no | grep -v -e ' memory/' -e ' decisions/' -e ' worklog/' | cut -c4- | paste -sd' ' -)
+        fail_with "memory is pushed, but this checkout stays at $(g rev-parse --short HEAD): ${blocked:-a file} has uncommitted changes that an incoming change would overwrite. Do not fix this with git; tell the user which file"
+        return 1
+    fi
+    rm -f "$state/pushed"
+}
+
+# Resolves one conflicted path in the private worktree from the index stages (1 base, 2 upstream,
+# 3 the local commit being replayed). Both sides present: combine them. One side deleted: keep the
+# side that still has the file, so an edit beats a delete. worklog/ is a copy of the Worklog, not
+# knowledge, and its JSON must stay whole: the replayed snapshot wins.
+resolve() {
+    case "$1" in
+        worklog/*)
+            if w show ":3:$1" >"$wt/$1" 2>/dev/null || w show ":2:$1" >"$wt/$1" 2>/dev/null; then w add -- "$1"
+            else w rm -q --cached --ignore-unmatch -- "$1" >/dev/null; rm -f "$wt/$1"; fi
+            return 0 ;;
+    esac
+    d=$(mktemp -d)
+    w show ":1:$1" >"$d/base" 2>/dev/null || : >"$d/base"
+    if w show ":2:$1" >"$d/ours" 2>/dev/null; then
+        if w show ":3:$1" >"$d/theirs" 2>/dev/null; then combine "$d/base" "$d/ours" "$d/theirs" "$1"; fi
+        cp "$d/ours" "$wt/$1"
+        w add -- "$1"
+    elif w show ":3:$1" >"$d/theirs" 2>/dev/null; then
+        cp "$d/theirs" "$wt/$1"
+        w add -- "$1"
+    else
+        w rm -q --cached --ignore-unmatch -- "$1" >/dev/null
+        rm -f "$wt/$1"
+    fi
+    rm -rf "$d"
+}
+
+# Prints the `modified:` timestamp in <file>'s frontmatter, if it has one.
+stamp_of() {
+    awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit }
+        /^[[:space:]]+modified:[[:space:]]*[0-9][0-9T:.Z+-]*$/ { sub(/^[[:space:]]+modified:[[:space:]]*/, ""); print; exit }' "$1"
+}
+
+# Sets the `modified:` line in <file>'s frontmatter to <stamp>, where there is one.
+set_stamp() {
+    awk -v s="$2" 'NR == 1 { fm = ($0 == "---"); print; next } fm && $0 == "---" { fm = 0 }
+        fm && /^[[:space:]]+modified:/ { sub(/modified:.*/, "modified: " s) } { print }' "$1" >"$1.stamp" && mv "$1.stamp" "$1"
+}
+
+# Combines two versions of a memory or decision file into <ours>: <base> <ours> <theirs> <path>. A
+# clean three-way merge is used as is; otherwise both versions are kept, the other one fenced below a
+# marker that the index flags and the consolidation pass reconciles. Never fails.
+combine() {
+    base=$1 ours=$2 theirs=$3 path=$4
+    cmp -s "$ours" "$theirs" && return 0
+    # Claude Code stamps `modified:` into a memory's metadata on every write, so two edits to different
+    # parts of one memory would always conflict on that line. All three versions take the newest stamp.
+    stamp=$(for f in "$base" "$ours" "$theirs"; do stamp_of "$f"; done | sort | tail -n 1)
+    if [ -n "$stamp" ]; then
+        for f in "$base" "$ours" "$theirs"; do set_stamp "$f" "$stamp"; done
+    fi
+    # Two sessions that re-confirmed the same memory differ only in date and verified: newer wins.
+    if [ "$(grep -Ev '^[[:space:]]+(date|verified):' "$ours")" = "$(grep -Ev '^[[:space:]]+(date|verified):' "$theirs")" ]; then
+        d_ours=$(sed -n 's/^[[:space:]]*date:[[:space:]]*//p' "$ours" | head -n 1)
+        d_theirs=$(sed -n 's/^[[:space:]]*date:[[:space:]]*//p' "$theirs" | head -n 1)
+        if [ "$(printf '%s\n%s\n' "$d_ours" "$d_theirs" | sort | tail -n 1)" != "$d_ours" ]; then cp "$theirs" "$ours"; fi
+        return 0
+    fi
+    keep=$(mktemp)
+    cp "$ours" "$keep"
+    if git merge-file -q "$ours" "$base" "$theirs" 2>/dev/null; then
+        rm -f "$keep"
+        return 0
+    fi
+    {
+        cat "$keep"
+        printf '\n<!-- hive:sibling -->\n'
+        printf 'Another session changed %s at the same time. Both versions are kept: the one above and the one below. Reconcile them into one, and delete this marker and everything after it.\n\n' "$path"
+        echo '~~~~~~~~'
+        cat "$theirs"
+        echo '~~~~~~~~'
+    } >"$ours"
+    rm -f "$keep"
+    return 0
+}
+
+# Commits pending changes and exchanges them until no save is pending. A save that finds the lock
+# taken leaves its request in $state/pending for the holder rather than queueing behind it.
+run_pending() {
+    while [ -f "$state/pending" ]; do
+        rm -f "$state/pending"
+        on_main || return 1
+        commit_local || { fail_with "commit failed; see $log"; return 1; }
+        exchange || return 1
+    done
+    return 0
+}
+
+# --- links ------------------------------------------------------------------------------------------
+
+backup="$cfg/hive-backup/$(date -u +%Y%m%dT%H%M%SZ)"
+backup_dir() { mkdir -p "$backup" && echo "$backup"; }
+
+same_tree() { diff -rq -x .DS_Store -x __pycache__ "$1" "$2" >/dev/null 2>&1; }
+
+# Points <link> at <target>. Replaces our own stale links and identical copies an older install left;
+# anything else is a conflict, reported in install and left alone unless --force moves it to a backup.
+# In check mode nothing changes; every link that is not already right counts as a conflict.
+link() {
+    target=$1 path=$2
+    # Already the hive, through a link higher up (a ~/.claude/skills that is itself a link here):
+    # nothing to do, and above all nothing to delete.
+    if [ ! -L "$path" ] && [ -d "$path" ] && [ "$(cd "$path" && pwd -P)" = "$target" ]; then
+        return 0
+    fi
+    # In an agentctl sandbox a real skill directory is the agent's own, from its definition, and wins
+    # over the hive's of the same name. agentd rewrites it on every pass, and would write through a
+    # link into the checkout, so it is never taken over, even with --force.
+    case "$path" in
+        "$cfg"/skills/*)
+            if [ -n "${AGENT_NAME:-}" ] && [ ! -L "$path" ] && [ -d "$path" ]; then
+                agent_skills="$agent_skills ${path##*/}"
+                return 0
+            fi ;;
+    esac
+    if [ "$mode" = check ]; then
+        [ -L "$path" ] && [ "$(readlink "$path")" = "$target" ] || conflicts=$((conflicts + 1))
+        return 0
+    fi
+    if [ -L "$path" ]; then
+        current=$(readlink "$path")
+        [ "$current" = "$target" ] && return 0
+        case "$current" in
+            "$hive"/*) rm "$path" ;;
+            *)
+                # Another checkout's link, say after the hive was cloned somewhere new.
+                if [ "$force" = 1 ]; then
+                    mv "$path" "$(backup_dir)/"
+                    [ "$mode" = report ] && say "moved the link $path ($current) to $(backup_dir)/"
+                else
+                    conflict "$path links to $current"
+                    return 0
+                fi ;;
+        esac
+    elif [ -e "$path" ]; then
+        if [ -d "$path" ] && same_tree "$target" "$path"; then
+            rm -rf "$path"
+        elif [ "$force" = 1 ]; then
+            mv "$path" "$(backup_dir)/"
+            [ "$mode" = report ] && say "moved $path to $(backup_dir)/"
+        else
+            conflict "$path exists and differs from $target"
+            return 0
+        fi
+    fi
+    mkdir -p "$(dirname "$path")"
+    ln -sn "$target" "$path"
+    [ "$mode" = report ] && say "linked $path"
+    return 0
+}
+
+conflict() {
+    conflicts=$((conflicts + 1))
+    [ "$mode" = report ] && say "skipped: $1 (rerun install with --force to move it aside)"
+    return 0
+}
+
+# Links instructions/ as a user rules directory and every skill; drops links whose target is gone.
+link_all() {
+    mode=$1
+    conflicts=0 agent_skills=
+    link "$hive/instructions" "$cfg/rules/hive"
+    for d in "$hive"/skills/*/; do
+        [ -f "$d/SKILL.md" ] || continue
+        s=$(basename "$d")
+        link "$hive/skills/$s" "$cfg/skills/$s"
+    done
+    [ "$mode" = check ] && return 0
+    for l in "$cfg"/skills/* "$cfg"/rules/*; do
+        [ -L "$l" ] || continue
+        case "$(readlink "$l")" in
+            "$hive"/*) [ -e "$l" ] || { rm "$l"; [ "$mode" = report ] && say "removed stale link $l"; } ;;
+        esac
+    done
+    return 0
+}
+
+unlink_all() {
+    for l in "$cfg"/skills/* "$cfg"/rules/*; do
+        [ -L "$l" ] || continue
+        case "$(readlink "$l")" in "$hive"/*) rm "$l"; say "removed $l" ;; esac
+    done
+}
+
+# --- settings ---------------------------------------------------------------------------------------
+
+# Adds or removes the hive's keys in Claude Code's user settings, keeping everything else. `check`
+# writes nothing and fails when installing would change the hive's keys. `update` installs only when
+# that would change something, prints what changed, and leaves an autoMemoryDirectory pointed elsewhere
+# alone.
+settings() {
+    python3 -I - "$1" "$cfg/settings.json" "$self" "$hive/memory" "$force" <<'EOF'
+import json, os, shlex, sys, tempfile
+
+mode, path, cmd, memdir, force = sys.argv[1:6]
+quoted = shlex.quote(cmd)
+ours = {
+    "SessionStart": {"hooks": [{"type": "command", "command": quoted + " sync --hook", "timeout": 30}]},
+    "PreToolUse": {"matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                   "hooks": [{"type": "command", "command": quoted + " guard", "timeout": 10}]},
+    # The keep-alive's Stop hook waits 55 minutes in the background; the timeout must outlast that.
+    "Stop": {"hooks": [{"type": "command", "command": quoted + " save --background", "timeout": 10},
+                       {"type": "command", "command": quoted + " keepalive stop", "timeout": 7200, "asyncRewake": True}]},
+    "UserPromptSubmit": {"hooks": [{"type": "command", "command": quoted + " keepalive prompt", "timeout": 10}]},
+    "SessionEnd": {"hooks": [{"type": "command", "command": quoted + " save --background", "timeout": 10},
+                             {"type": "command", "command": quoted + " keepalive end", "timeout": 10}]},
+}
+try:
+    with open(path) as f:
+        s = json.load(f)
+except FileNotFoundError:
+    s = {}
+except ValueError as e:
+    sys.exit(f"hive: {path} is not valid JSON ({e}); fix it and rerun")
+before = json.loads(json.dumps(s))
+
+def mine(group):
+    # This checkout's hooks, and any other checkout's: a hive cloned somewhere new replaces them.
+    for h in group.get("hooks", []):
+        c = h.get("command", "")
+        if c.startswith(quoted + " ") or ("bin/hive" in c and c.endswith((" sync --hook", " save --background", " guard",
+                                                                          " keepalive stop", " keepalive prompt", " keepalive end"))):
+            return True
+    return False
+
+hooks = s.get("hooks", {})
+for event in list(hooks):
+    hooks[event] = [g for g in hooks[event] if not mine(g)]
+    if not hooks[event]:
+        del hooks[event]
+
+current = s.get("autoMemoryDirectory")
+if mode in ("install", "check", "update"):
+    if current not in (None, memdir) and force != "1":
+        if mode == "check":
+            sys.exit(1)
+        if mode == "update":
+            sys.exit(0)
+        sys.exit(f"hive: autoMemoryDirectory is already {current}; rerun with --force to point it at {memdir}")
+    s["autoMemoryDirectory"] = memdir
+    # Claude Code's own background consolidation would rewrite the shared pool unreviewed, from
+    # whichever machine it ran on; the hive's tidy does that job.
+    s["autoDreamEnabled"] = False
+    # Idle compaction would summarise a long session just before the keep-alive's first ping, which
+    # keeps long sessions whole on purpose; the recap Claude Code writes into the chat on a return goes
+    # with it.
+    s["idleCompaction"] = False
+    s["awaySummaryEnabled"] = False
+    # Agents commit and open pull requests under their own accounts: no model is named in commits or
+    # pull request descriptions, on any machine.
+    attribution = s.get("attribution") if isinstance(s.get("attribution"), dict) else {}
+    attribution.update(commit="", pr="")
+    s["attribution"] = attribution
+    for event, group in ours.items():
+        hooks.setdefault(event, []).append(group)
+elif current == memdir:
+    del s["autoMemoryDirectory"]
+    for key in ("autoDreamEnabled", "idleCompaction", "awaySummaryEnabled"):
+        if s.get(key) is False:
+            del s[key]
+    attribution = s.get("attribution")
+    if isinstance(attribution, dict):
+        for key in ("commit", "pr"):
+            if attribution.get(key) == "":
+                del attribution[key]
+        if not attribution:
+            del s["attribution"]
+
+if hooks:
+    s["hooks"] = hooks
+else:
+    s.pop("hooks", None)
+
+# Where the hive's hook groups sit among others doesn't matter.
+def norm(d):
+    return {**d, "hooks": {e: sorted(json.dumps(g, sort_keys=True) for g in gs) for e, gs in d.get("hooks", {}).items()}}
+if mode == "check":
+    sys.exit(0 if norm(s) == norm(before) else 1)
+if mode == "update":
+    new, old = norm(s), norm(before)
+    if new == old:
+        sys.exit(0)
+    keys = sorted(k for k in set(new) | set(old) if k != "hooks" and new.get(k) != old.get(k))
+    events = sorted(e for e in set(new["hooks"]) | set(old["hooks"]) if new["hooks"].get(e) != old["hooks"].get(e))
+    print(", ".join(keys + [e + " hooks" for e in events]))
+
+# Write through a link (dotfile managers link settings.json), and keep the file's mode.
+path = os.path.realpath(path)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+mode_bits = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o644
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings.")
+with os.fdopen(fd, "w") as f:
+    json.dump(s, f, indent=2)
+    f.write("\n")
+os.chmod(tmp, mode_bits)
+os.replace(tmp, path)
+EOF
+}
+
+installed() {
+    [ -f "$cfg/settings.json" ] && grep -qF "$self" "$cfg/settings.json"
+}
+
+# Brings the hive's keys in the settings up to what this checkout installs, on a machine that has
+# installed this checkout. Sync runs it after every merge, as a fresh process, so the script just pulled
+# decides what that is. Not in a sandbox: agentd copies the agent's home over the settings every 30
+# seconds, so they are its, and writing them would hide from `hive status` a home that is not the
+# hive's (sandbox/README.md).
+cmd_settings() {
+    [ -z "${AGENT_NAME:-}" ] || return 0
+    installed && command -v python3 >/dev/null || return 0
+    changed=$(settings update)
+    [ -z "$changed" ] || say "updated $cfg/settings.json to what this checkout installs ($changed); sessions started from now on use it"
+}
+
+# --- migration from the copy-based install ----------------------------------------------------------
+
+# The first version of this repository copied workflow.md into a marked block of CLAUDE.md, copied the
+# skills into ~/.claude/skills, and kept a checksum of each copy in .hive/. A copy that still
+# matches its checksum was never edited, so it goes, the renamed consolidate-memory included; an
+# edited one stays and is reported by link_all. The block would duplicate what the rules link loads.
+old_sum() { (cd "$1" && find . -type f ! -name .DS_Store -exec cksum {} + | LC_ALL=C sort -k3 | cksum); }
+migrate() {
+    records="$cfg/.hive"
+    if [ -d "$records" ]; then
+        for rec in "$records"/skill-*; do
+            [ -f "$rec" ] || continue
+            name=${rec##*/skill-}
+            copy="$cfg/skills/$name"
+            if [ -d "$copy" ] && [ ! -L "$copy" ] && [ "$(old_sum "$copy")" = "$(cat "$rec")" ]; then
+                mv "$copy" "$(backup_dir)/"
+                say "moved the old, unedited copy of skill $name to $(backup_dir)/"
+            fi
+        done
+        mv "$records" "$(backup_dir)/install-records"
+        say "moved the old install records to $(backup_dir)/install-records"
+    fi
+    md="$cfg/CLAUDE.md"
+    if [ -f "$md" ] && grep -qxF "$start_marker" "$md"; then
+        if ! grep -qxF "$end_marker" "$md"; then
+            say "skipped: $md has the old workflow block's start marker but not its end; remove the block by hand"
+            return 0
+        fi
+        awk -v s="$start_marker" -v e="$end_marker" '$0 == s { f = 1 } f { print } $0 == e { f = 0 }' "$md" \
+            >"$(backup_dir)/CLAUDE.md-workflow-block"
+        tmp=$(mktemp "$state/CLAUDE.md.XXXXXX")
+        awk -v s="$start_marker" -v e="$end_marker" '$0 == s { skip = 1 } !skip { print } $0 == e { skip = 0 }' "$md" >"$tmp"
+        # cat, not mv: CLAUDE.md may be a link, and its mode stays.
+        cat "$tmp" >"$md"
+        rm -f "$tmp"
+        say "removed the old workflow block from $md (saved in $(backup_dir)/)"
+    fi
+}
+
+# --- commands ---------------------------------------------------------------------------------------
+
+cmd_install() {
+    command -v python3 >/dev/null || die "install needs python3 to edit $cfg/settings.json"
+    g remote get-url origin >/dev/null 2>&1 || die "$hive has no origin remote"
+    # Installs run concurrently (a pre-launch step per session launch) and race hook syncs over the
+    # same links and settings: one at a time.
+    lock 30 || die "another hive command held the lock for 30 seconds; try again"
+    migrate
+    link_all report
+    settings install
+    say "settings: autoMemoryDirectory is $hive/memory; SessionStart, UserPromptSubmit, PreToolUse, Stop and SessionEnd hooks run $self"
+    rebuild_index
+    link_command
+    old=$(find "$cfg/projects" -path '*/memory/*.md' ! -name MEMORY.md 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$old" != 0 ]; then
+        say "$old memory files under $cfg/projects/*/memory no longer load: memory now lives in the hive."
+        say "they are untouched; to bring the ones worth keeping across, ask a session to run the consolidate-hive skill in import mode."
+    fi
+    [ "$conflicts" = 0 ] || say "$conflicts item(s) skipped; see above"
+    say "installed. New sessions use the hive; running sessions pick it up when restarted."
+}
+
+# `hive` by name: a link in ~/.local/bin, where agentctl's installer also puts agentctl. Anything else
+# already there by that name is left alone.
+command_link="$HOME/.local/bin/hive"
+link_command() {
+    if [ "$(readlink "$command_link" 2>/dev/null)" = "$self" ]; then
+        :
+    elif [ -e "$command_link" ] || [ -L "$command_link" ]; then
+        say "skipped: $command_link exists and is not this hive's; run $self by its path"
+        return 0
+    else
+        mkdir -p "$(dirname "$command_link")"
+        ln -s "$self" "$command_link"
+        say "linked $command_link, so \`hive\` runs this checkout's bin/hive"
+    fi
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) say "$HOME/.local/bin is not on your PATH; to run \`hive\` by name, add to your shell profile: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+    found=$(command -v hive 2>/dev/null || true)
+    if [ -n "$found" ] && [ "$found" != "$command_link" ]; then
+        say "note: $found comes first on your PATH, so \`hive\` runs that, not this checkout"
+    fi
+    return 0
+}
+
+cmd_uninstall() {
+    command -v python3 >/dev/null || die "uninstall needs python3 to edit $cfg/settings.json"
+    settings uninstall
+    unlink_all
+    if [ "$(readlink "$command_link" 2>/dev/null)" = "$self" ]; then
+        rm "$command_link"
+        say "removed $command_link"
+    fi
+    say "uninstalled; $hive and its memory are untouched"
+}
+
+cmd_sync() {
+    hook=0
+    [ "${1:-}" = --hook ] && hook=1
+    # A session that started before this machine linked the hive has loaded none of it.
+    cold=0
+    [ "$(readlink "$cfg/rules/hive" 2>/dev/null)" = "$hive/instructions" ] || cold=1
+    # A cold session is told what to read whatever happens next, even if the lock never comes free.
+    [ "$hook" = 1 ] && [ "$cold" = 1 ] && report_cold
+    # At a session start, wait briefly: the session matters more than this sync, and the next one
+    # picks up whatever this one skips.
+    if ! lock "$([ "$hook" = 1 ] && echo 5 || echo 20)"; then
+        [ "$hook" = 1 ] || say "another sync or save is running; try again"
+        exit 0
+    fi
+    touch "$state/pending"
+    ok=1
+    run_pending || ok=0
+    link_all quiet
+    rebuild_index
+    # A merge that changes what install writes needs no install. In hook mode the session has no use
+    # for the line; the log keeps it.
+    if ! settings_out=$("$self" settings 2>&1); then
+        say "could not update Claude Code's settings: ${settings_out#hive: }"
+    elif [ -n "$settings_out" ]; then
+        if [ "$hook" = 1 ]; then logline "$settings_out"; else printf '%s\n' "$settings_out"; fi
+    fi
+    unlock
+    # A save that arrived while this sync held the lock: let it run without holding up the session.
+    # (An if, not `[ ] || cmd &`: bash would background the whole list in a subshell that holds stdout.)
+    if [ -f "$state/pending" ]; then
+        nohup "$self" save </dev/null >>"$log" 2>&1 &
+    fi
+    # At most every six hours per machine, look in the background whether a tidy or harvest is due.
+    if [ "$hook" = 1 ] && tidy_enabled && [ -z "$(find "$state/tidy-checked" -mmin -360 2>/dev/null)" ]; then
+        touch "$state/tidy-checked"
+        nohup "$self" tidy --auto </dev/null >>"$log" 2>&1 &
+    fi
+    if [ "$hook" = 1 ]; then
+        [ "$cold" = 1 ] || report_incoming
+        report_drift
+        [ "$ok" = 1 ] || say "sync failed: $(cat "$state/error" 2>/dev/null || echo unknown). Working from the local copy at $(g rev-parse --short HEAD); memory written now is kept and pushed once sync works. Details: \`$self status\`."
+    elif [ "$ok" = 1 ]; then
+        say "in sync with origin/$branch at $(g rev-parse --short HEAD)"
+    else
+        rm -f "$incoming"
+        die "sync failed: $(cat "$state/error" 2>/dev/null || echo unknown)"
+    fi
+    rm -f "$incoming"
+}
+
+# Tells a cold session what it would otherwise have loaded at startup. Happens once per machine: the
+# first session after a fresh clone, as in a new sandbox bootstrapped by this hook. Paths, not
+# contents: Claude Code cuts hook output past roughly 10KB down to a 2KB preview, and the instructions
+# alone are past that.
+report_cold() {
+    say "this session started before the hive was linked on this machine, so it has not loaded the hive's instructions or memory index. Before anything else, read each of these files in full and follow them as if they were part of your instructions; later sessions load them on their own:"
+    for f in "$hive"/instructions/*.md; do
+        [ -f "$f" ] && echo "- $f"
+    done
+    # Printed before the sync rebuilds it, so it may not exist yet; it will by the time it is read.
+    echo "- $hive/memory/MEMORY.md"
+    return 0
+}
+
+# Tells a session what arrived from other machines after its context was loaded. Interactive
+# sessions often pick changed files up before the first prompt anyway; headless ones never do.
+# Duplicating a few lines is the cheaper failure.
+report_incoming() {
+    [ -s "$incoming" ] || return 0
+    # Last status per path; a skill counts once however many of its files changed.
+    awk -F'\t' '{ p = $NF; if (p ~ /^skills\//) { split(p, a, "/"); p = "skills/" a[2] }
+                  if (p != "memory/MEMORY.md" && p !~ /^memory\/\./) st[p] = substr($1, 1, 1) }
+                END { for (p in st) print st[p] "\t" p }' "$incoming" | sort -t "$(printf '\t')" -k2 >"$incoming.sorted"
+    n=$(wc -l <"$incoming.sorted" | tr -d ' ')
+    if [ "$n" != 0 ]; then
+        say "$n change(s) from other sessions arrived after this session loaded its memory and instructions:"
+        head -n 15 "$incoming.sorted" | while IFS="$(printf '\t')" read -r status path; do
+            case "$path" in
+                memory/*)
+                    if [ "$status" = D ] || [ ! -f "$hive/$path" ]; then echo "- memory removed: $path"
+                    else entries "$hive/$path" | cut -f2-; fi ;;
+                instructions/*) echo "- instructions changed: $hive/$path (re-read it before relying on your copy)" ;;
+                skills/*) echo "- skill changed: ${path#skills/} (takes effect in the next session)" ;;
+            esac
+        done
+        [ "$n" -le 15 ] || echo "- … and $((n - 15)) more: git -C $hive log --stat"
+    fi
+    rm -f "$incoming.sorted"
+}
+
+cmd_save() {
+    if [ "${1:-}" = --background ]; then
+        # The common case, nothing to do, returns without forking. Commits already pushed while the
+        # checkout could not move (see move_live) are not work to do.
+        if [ -z "$(g status --porcelain -- memory decisions worklog)" ] \
+            && { [ -z "$(g rev-list "origin/$branch..HEAD" 2>/dev/null)" ] \
+                 || [ "$(cat "$state/pushed" 2>/dev/null)" = "$(g rev-parse HEAD)" ]; }; then
+            exit 0
+        fi
+        touch "$state/pending"
+        nohup "$self" save </dev/null >>"$log" 2>&1 &
+        exit 0
+    fi
+    touch "$state/pending"
+    ok=1
+    while :; do
+        trylock || exit 0
+        run_pending || ok=0
+        rebuild_index
+        unlock
+        rm -f "$incoming"
+        # A request that arrived between the last check and the unlock found the lock taken.
+        [ -f "$state/pending" ] || break
+    done
+    [ "$ok" = 1 ]
+}
+
+# --- keep-alive -------------------------------------------------------------------------------------
+
+# Claude Code caches a session's prompt for an hour from its last use. A long session kept on
+# purpose, and come back to after more than an hour writes its whole context to the cache again,
+# at about twice the price of input, instead of reading it at a tenth. The keep-alive pings an idle
+# session before the hour is up:
+#
+# - The Stop hook (`keepalive stop`, asyncRewake) runs in the background after every turn and waits 55
+#   minutes. If no turn ended meanwhile, it exits 2, which wakes the model with its stderr as a one-line
+#   ping. The woken turn ends in another Stop, which waits again; a newer turn ends an older wait.
+# - Only interactive sessions (CLAUDE_CODE_ENTRYPOINT=cli) with 100k tokens of context or more. A
+#   headless `claude -p` waits for an asyncRewake hook to exit, so would hang.
+# - It stops 4 hours after the last turn that did not answer a ping, or 16 after a message saying "keep
+#   it hot" ("keep this session warm" and the like), which also lifts the 100k floor; "go cold"
+#   ("let this session go cold", "lets go cold for now") turns it off for the session. The UserPromptSubmit hook (`keepalive
+#   prompt`) reads the phrases; SessionEnd (`keepalive end`) drops the session's state.
+# - asyncRewake is missing from Claude Code's public docs, so the hook waits only under a Claude Code
+#   binary that still names it, and checks that each woken turn read its context from the cache. Those
+#   problems, logged in $state/keepalive.log, make a tidy due, whose drift step judges them.
+keepalive_delay=${HIVE_KEEPALIVE_DELAY:-3300}
+keepalive_min_tokens=100000
+keepalive_window=14400
+keepalive_hot_window=57600
+# A ping later than this after the session's last request finds the cache gone, and pays to write it.
+keepalive_ttl_minutes=59
+
+cmd_keepalive() {
+    mode=${1:-}
+    case "$mode" in stop|prompt|end) ;; *) die "usage: hive keepalive stop|prompt|end (Claude Code runs these as hooks)" ;; esac
+    [ "${CLAUDE_CODE_ENTRYPOINT:-}" = cli ] && [ -z "${HIVE_TIDY_SESSION:-}" ] || exit 0
+    command -v python3 >/dev/null 2>&1 || exit 0
+    facts=$(keepalive_facts "$mode") || exit 0
+    [ -n "$facts" ] || exit 0
+    read -r sid phrase transcript <<EOF
+$facts
+EOF
+    dir="$state/keepalive/$sid"
+    case "$mode" in
+        end) keepalive_disarm; rm -rf "$dir" ;;
+        prompt)
+            # A turn is starting: the wait the last one armed must not ping in the middle of it.
+            keepalive_disarm
+            case "$phrase" in
+                hot) mkdir -p "$dir" && touch "$dir/hot" && rm -f "$dir/off" ;;
+                cold) mkdir -p "$dir" && touch "$dir/off" ;;
+            esac ;;
+        stop) keepalive_stop ;;
+    esac
+    exit 0
+}
+
+# Prints "<session> <phrase> <transcript>" from the hook's input on stdin; the phrase is hot, cold or -.
+# Prints nothing for input it cannot use.
+keepalive_facts() {
+    python3 -I -c '
+import json, re, sys
+try:
+    call = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(call, dict):
+    sys.exit(0)
+sid, path, prompt = call.get("session_id"), call.get("transcript_path"), call.get("prompt")
+if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", sid):
+    sys.exit(0)
+path = path if isinstance(path, str) and path and "\n" not in path else "-"
+prompt = prompt.lower() if isinstance(prompt, str) else ""
+cold = re.search(r"\bgo(ing)? cold\b", prompt)
+hot = re.search(r"\bkeep (it|this|the)( session| one)? (hot|warm)\b", prompt)
+print(sid, "cold" if cold else "hot" if hot else "-", path)
+'
+}
+
+# Reads the requests of the session's main conversation from its transcript, the last MiB first and
+# the whole file when that is not enough. `keepalive_usage last` prints the newest one's context
+# tokens, and `keepalive_usage at` its unix time; `keepalive_usage after <unix time>` prints
+# "<cache read> <cache write>" of the first at or after that time, or nothing.
+keepalive_usage() {
+    python3 -I -c '
+import datetime, json, sys
+mode, path = sys.argv[1], sys.argv[2]
+since = float(sys.argv[3]) if mode == "after" else 0
+
+def requests(lines):
+    for raw in lines:
+        if b"\"usage\"" not in raw:
+            continue
+        try:
+            e = json.loads(raw)
+            if e.get("type") != "assistant" or e.get("isSidechain"):
+                continue
+            u = e["message"]["usage"]
+            r, w = int(u.get("cache_read_input_tokens") or 0), int(u.get("cache_creation_input_tokens") or 0)
+            at = datetime.datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
+            yield at, int(u.get("input_tokens") or 0) + r + w, r, w
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+
+try:
+    with open(path, "rb") as fh:
+        fh.seek(0, 2)
+        size = fh.tell()
+        for start in sorted({max(0, size - (1 << 20)), 0}, reverse=True):
+            fh.seek(start)
+            found = list(requests(fh.read().splitlines()))
+            if mode == "last" and found:
+                print(found[-1][1])
+                break
+            if mode == "at" and found:
+                print(int(found[-1][0]))
+                break
+            later = [f for f in found if f[0] >= since]
+            # The first is the one that met the cache as the ping left it; later ones read what it wrote.
+            if mode == "after" and (start == 0 or len(later) < len(found)):
+                if later:
+                    print(later[0][2], later[0][3])
+                break
+except OSError:
+    pass
+' "$1" "$transcript" "${2:-}"
+}
+
+# Logs whether the turn that answered the last ping read the session's context from the cache, once
+# the transcript holds that turn: Claude Code can write it after the turn's Stop hook has read the
+# transcript (2.1.316).
+keepalive_measure() {
+    [ -f "$dir/pinged" ] || return 0
+    m=$(keepalive_usage after "$(cat "$dir/pinged")")
+    [ -n "$m" ] || return 0
+    rm -f "$dir/pinged"
+    read -r cread cwrite <<EOF
+$m
+EOF
+    if [ "$cwrite" -gt "$cread" ]; then
+        keepalive_log miss "the woken turn wrote $cwrite tokens to the cache and read $cread"
+        touch "$dir/missed"
+    else
+        keepalive_log warm "the woken turn read $cread tokens from the cache and wrote $cwrite"
+    fi
+}
+
+keepalive_stop() {
+    mkdir -p "$dir"
+    # Old sessions' state goes; a session idle that long has nothing left to keep warm.
+    find "$state/keepalive" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} + 2>/dev/null || true
+    # This turn supersedes the wait an earlier one armed, whatever happens next.
+    keepalive_disarm
+    printf -- '- %s\n' "$(date +%s)" >"$dir/armed"
+    keepalive_measure
+    if [ -f "$dir/awaiting" ]; then
+        # The turn that ended answered a ping: the session is as idle as before it.
+        rm -f "$dir/awaiting"
+    else
+        date +%s >"$dir/last"
+        echo 0 >"$dir/pings"
+        rm -f "$dir/missed"
+    fi
+    [ ! -f "$dir/off" ] && [ ! -f "$dir/missed" ] || return 0
+    tokens=$(keepalive_usage last)
+    [ "${tokens:-0}" -ge "$keepalive_min_tokens" ] || [ -f "$dir/hot" ] || return 0
+    # Everything above is quick: under a Claude Code without asyncRewake this hook runs in the
+    # foreground, and must return before it waits.
+    keepalive_supported || return 0
+
+    me="$$ $(date +%s)"
+    printf '%s\n' "$me" >"$dir/armed"
+    trap '[ -z "${sleeper:-}" ] || kill "$sleeper" 2>/dev/null; exit 0' TERM INT HUP
+    sleep "$keepalive_delay" &
+    sleeper=$!
+    wait "$sleeper" || true
+    trap - TERM INT HUP
+
+    [ "$(cat "$dir/armed" 2>/dev/null)" = "$me" ] && [ ! -f "$dir/off" ] || return 0
+    keepalive_measure
+    [ ! -f "$dir/missed" ] || return 0
+    now=$(date +%s)
+    idle=$((now - $(cat "$dir/last" 2>/dev/null || echo "$now")))
+    pings=$(cat "$dir/pings" 2>/dev/null || echo 0)
+    window=$keepalive_window
+    [ ! -f "$dir/hot" ] || window=$keepalive_hot_window
+    if [ "$idle" -gt "$window" ] || [ "$pings" -gt $((window / keepalive_delay)) ]; then
+        keepalive_log cold "idle $((idle / 60)) min after $pings ping(s); letting it go cold"
+        return 0
+    fi
+    # A Mac asleep through the wait wakes too late: the cache has gone, and a ping would only pay to
+    # write it again. The time is the request's own: Claude Code writes to an idle session's transcript
+    # too (2.1.309), so the file's mtime can be newer than the cache.
+    at=$(keepalive_usage at)
+    if [ $((now - ${at:-0})) -gt $((keepalive_ttl_minutes * 60)) ]; then
+        keepalive_log late "woke more than $keepalive_ttl_minutes min after the session's last request; letting it go cold"
+        return 0
+    fi
+    pings=$((pings + 1))
+    echo "$pings" >"$dir/pings"
+    touch "$dir/awaiting"
+    date +%s >"$dir/pinged"
+    keepalive_log ping "$pings, idle $((idle / 60)) min"
+    echo "hive keep-alive ping $pings: this session has been idle $((idle / 60)) min, and this turn keeps its prompt cache warm. Reply with one short line and no tool calls." >&2
+    exit 2
+}
+
+# Ends the wait an earlier turn of this session armed, if its process is still waiting.
+keepalive_disarm() {
+    old=$(cut -d' ' -f1 "$dir/armed" 2>/dev/null || true)
+    case "$old" in ''|*[!0-9]*|"$$") return 0 ;; esac
+    case "$(ps -o command= -p "$old" 2>/dev/null || true)" in
+        *"keepalive stop"*) kill "$old" 2>/dev/null || true ;;
+    esac
+}
+
+# Whether the Claude Code running this hook still knows asyncRewake: without it the hook would hold
+# the session in the foreground for the whole wait. Checked once per binary, and logged when it does not.
+keepalive_supported() {
+    exe=$(claude_binary)
+    exe=${exe:-unset}
+    cache="$state/keepalive/support"
+    known=$(awk -F'\t' -v e="$exe" '$1 == e { k = $2 } END { print k }' "$cache" 2>/dev/null || true)
+    if [ -z "$known" ]; then
+        if [ -f "$exe" ] && LC_ALL=C grep -a -q -F asyncRewake "$exe"; then known=yes; else known=no; fi
+        printf '%s\t%s\n' "$exe" "$known" >>"$cache"
+        [ "$known" = yes ] || keepalive_log unsupported "Claude Code at $exe does not name asyncRewake, so the keep-alive is off under it"
+    fi
+    [ "$known" = yes ]
+}
+
+# Prints the path of the Claude Code binary running this hook. Hooks get its process id, CLAUDE_PID,
+# and not CLAUDE_CODE_EXECPATH, which Claude Code sets for its Bash tool (2.1.316).
+claude_binary() {
+    if [ -n "${CLAUDE_CODE_EXECPATH:-}" ]; then echo "$CLAUDE_CODE_EXECPATH"; return 0; fi
+    case "${CLAUDE_PID:-}" in ''|*[!0-9]*) return 0 ;; esac
+    python3 -I -c '
+import ctypes, os, sys
+pid = int(sys.argv[1])
+try:
+    print(os.readlink("/proc/%d/exe" % pid))
+except OSError:
+    try:
+        buf = ctypes.create_string_buffer(4096)
+        if ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath(pid, buf, 4096) > 0:
+            print(buf.value.decode())
+    except (OSError, AttributeError):
+        pass
+' "$CLAUDE_PID" 2>/dev/null || true
+}
+
+# Appends "<unix time> <UTC time> <session> <event> <detail>" to the keep-alive's log.
+keepalive_log() {
+    printf '%s %s %s %s %s\n' "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" "$1" "$2" >>"$state/keepalive.log"
+}
+
+# Prints the log's problems this machine has not yet put to a tidy: a Claude Code without asyncRewake,
+# and woken turns that missed the cache.
+keepalive_problems() {
+    since=$(cat "$state/keepalive-reported" 2>/dev/null || echo 0)
+    awk -v s="$since" '$1 > s && ($4 == "unsupported" || $4 == "miss")' "$state/keepalive.log" 2>/dev/null || true
+}
+
+# --- tidy -------------------------------------------------------------------------------------------
+
+# The automatic tidy keeps memory small and reconciled without anyone remembering to: a headless Claude
+# session runs the consolidate-hive skill in tidy mode when the hive needs it (the index near its
+# budget, a memory with two versions, or a week since the last tidy), at most once a day across every
+# machine. A claim ref pushed to origin decides which machine: pushing a ref that exists already, from
+# an unrelated commit, is refused. A machine that does not tidy harvests its own transcripts instead,
+# at most once a day, because they never leave it. HIVE_TIDY=off (or a file .git/hive/no-tidy) turns
+# all of it off on a machine; HIVE_TIDY_MODEL picks the model.
+#
+# Claude Code changes how it writes memory without notice, so a tidy also watches for drift: memory
+# files of a shape no tidy has checked make one due, and every tidy is told the running Claude Code
+# version, which the skill compares its memory instructions for. What a tidy finds reaches the user
+# through the next interactive session (report_drift): the tidy itself has no Worklog tools.
+tidy_command=${HIVE_TIDY_COMMAND:-claude}
+tidy_model=${HIVE_TIDY_MODEL:-claude-opus-5-5}
+
+tidy_enabled() {
+    [ "${HIVE_TIDY:-on}" != off ] && [ -z "${HIVE_TIDY_SESSION:-}" ] && [ ! -e "$state/no-tidy" ] \
+        && command -v "$tidy_command" >/dev/null 2>&1
+}
+
+# Prints why a tidy is due, or nothing.
+tidy_due() {
+    reasons=""
+    idx="$hive/memory/MEMORY.md"
+    if [ -f "$idx" ]; then
+        lines=$(wc -l <"$idx" | tr -d ' ')
+        chars=$(wc -c <"$idx" | tr -d ' ')
+        if grep -q 'more memories are not listed' "$idx" || [ "$lines" -gt $((index_lines_max * 9 / 10)) ] \
+            || [ "$chars" -gt $((index_chars_max * 9 / 10)) ]; then
+            reasons="$reasons index at $lines lines and $chars characters;"
+        fi
+    fi
+    siblings=$(grep -l '^<!-- hive:sibling' "$hive"/memory/*.md 2>/dev/null | wc -l | tr -d ' ')
+    [ "$siblings" = 0 ] || reasons="$reasons $siblings memory file(s) with two versions;"
+    problems=$(keepalive_problems | wc -l | tr -d ' ')
+    [ "$problems" = 0 ] || reasons="$reasons the keep-alive logged $problems problem(s) on this machine;"
+    last=$(g log -1 --format=%ct -- 'decisions/tidy/*.md' 2>/dev/null || true)
+    if [ -z "$last" ] || [ $(( $(date +%s) - last )) -gt $((7 * 86400)) ]; then
+        reasons="$reasons a week or more since the last tidy;"
+    fi
+    recorded=$(recorded_shape)
+    if [ -z "$recorded" ]; then
+        reasons="$reasons no tidy has recorded the memory files' shape;"
+    else
+        new=""
+        for t in $(memory_shape); do
+            case " $recorded " in *" $t "*) ;; *) new="$new $t" ;; esac
+        done
+        [ -z "$new" ] || reasons="$reasons memory files now use$new, which no tidy has checked;"
+    fi
+    printf '%s' "${reasons# }"
+}
+
+# Prints the memory files' shape: each frontmatter key in use, as key:<name>, and each style of file
+# name, as names:kebab, names:snake, names:other or names:nested.
+memory_shape() {
+    {
+        [ -z "$(find "$hive/memory" -mindepth 2 -name '*.md' 2>/dev/null | head -n 1)" ] || echo names:nested
+        awk 'FILENAME ~ /\/MEMORY\.md$/ { next }
+            FNR == 1 { fm = ($0 == "---"); n = FILENAME; sub(/.*\//, "", n); sub(/\.md$/, "", n)
+                print "names:" (n ~ /^[a-z0-9]+(-[a-z0-9]+)*$/ ? "kebab" : n ~ /^[a-z0-9]+(_[a-z0-9]+)*$/ ? "snake" : "other")
+                next }
+            fm && $0 == "---" { fm = 0 }
+            fm && /^ *[A-Za-z_][A-Za-z0-9_]*:/ { k = $0; sub(/^ */, "", k); sub(/:.*/, "", k); print "key:" k }' \
+            "$hive"/memory/*.md 2>/dev/null
+    } | sort -u | paste -sd' ' -
+}
+
+# Prints the shape the newest tidy log recorded, from its "Memory shape:" line.
+recorded_shape() {
+    printf '%s\n' "$hive"/decisions/tidy/*.md | sort -r | while IFS= read -r f; do
+        l=$(grep '^Memory shape: ' "$f" 2>/dev/null | head -n 1)
+        # An if, not `[ ] && …`: a loop ending on a false test fails the function, and set -e exits.
+        if [ -n "$l" ]; then l=${l#Memory shape: }; printf '%s\n' "${l%.}"; break; fi
+    done
+}
+
+# Tells an interactive session that the newest tidy log with "- Drift:" lines found Claude Code changing
+# how memory works, so it reaches the user's Worklog. Once for the whole hive, not per machine: the
+# marker is committed and pushed like memory, so a new sandbox is not told about drift already handled.
+report_drift() {
+    [ -z "${HIVE_TIDY_SESSION:-}" ] || return 0
+    f=$(grep -l '^- Drift: ' "$hive"/decisions/tidy/*.md 2>/dev/null | sort | tail -n 1)
+    [ -n "$f" ] || return 0
+    f=${f#"$hive"/}
+    [ "$(cat "$hive/decisions/tidy/drift-reported" 2>/dev/null)" = "$f" ] && return 0
+    say "the tidy logged in $f found Claude Code changing how memory works (its \"- Drift:\" lines). Put it in the Worklog inbox as one item linking that log, unless the Worklog has one for it already, in any status."
+    printf '%s\n' "$f" >"$hive/decisions/tidy/drift-reported"
+}
+
+# What a tidy prompt ends with, for the skill's drift step, with the keep-alive's problems on this
+# machine when there are any.
+drift_detail() {
+    printf 'Claude Code version: %s. Memory shape: %s' \
+        "$("$tidy_command" --version 2>/dev/null | head -n 1)" "$(memory_shape)"
+    problems=$(keepalive_problems | cut -d' ' -f2- | tail -n 10 | paste -sd'|' - | sed 's/|/ | /g')
+    [ -z "$problems" ] || printf '. Keep-alive problems on this machine, from %s: %s' "$state/keepalive.log" "$problems"
+}
+
+# Succeeds when this machine has transcripts newer than its last harvest, and that was a day ago or more.
+harvest_due() {
+    since=$(cat "$state/harvested" 2>/dev/null || echo 0)
+    [ $(( $(date +%s) - since )) -gt 86400 ] || return 1
+    if [ "$since" = 0 ]; then
+        [ -n "$(find "$cfg/projects" -name '*.jsonl' 2>/dev/null | head -n 1)" ]
+    else
+        [ -n "$(find "$cfg/projects" -name '*.jsonl' -newer "$state/harvested" 2>/dev/null | head -n 1)" ]
+    fi
+}
+
+# Claims today's tidy for this machine; fails when another machine has. Keeps the newest 14 claims.
+claim_tidy() {
+    ref="refs/hive/tidy/$(date -u +%Y-%m-%d)"
+    empty=$(g hash-object -t tree /dev/null)
+    # The token makes every claim a distinct commit: two identical claims would both "succeed".
+    claim=$(printf 'tidy claimed by %s (%s)\n' "$(where)" "$token" | g commit-tree "$empty")
+    gnet push -q origin "$claim:$ref" 2>/dev/null || return 1
+    gnet ls-remote origin 'refs/hive/tidy/*' 2>/dev/null | awk '{ print $2 }' | sort -r | tail -n +15 |
+        while IFS= read -r old; do gnet push -q origin --delete "$old" 2>/dev/null || true; done
+    return 0
+}
+
+# Starts the headless session for <mode> (tidy or harvest) in the checkout, detached, with <detail>.
+# Never with permissions skipped (least privilege, in a sandbox or out of one):
+# dontAsk refuses, without asking, every tool the allowlist does not name. The allowlist is reading,
+# editing memory/ and decisions/ only, read-only git and gh, the harvest script, `hive index` and
+# `hive usage`.
+spawn_tidy() {
+    prompt="Run the consolidate-hive skill in $1 mode, unattended. The hive checkout is $hive. $2"
+    turns="$hive/skills/consolidate-hive/scripts/recent-turns.sh"
+    linked_turns="$cfg/skills/consolidate-hive/scripts/recent-turns.sh"
+    (
+        cd "$hive" || exit 0
+        # The prompt goes first: --allowedTools takes every argument after it.
+        HIVE_TIDY_SESSION=1 nohup "$tidy_command" -p "$prompt" --model "$tidy_model" --permission-mode dontAsk \
+            --allowedTools "Read" "Glob" "Grep" "Skill(consolidate-hive)" \
+            "Edit(/$hive/memory/**)" "Edit(/$hive/decisions/**)" \
+            "Bash(git log *)" "Bash(git show *)" "Bash(git diff *)" \
+            "Bash(gh pr view *)" "Bash(gh issue view *)" "Bash(gh release list *)" \
+            "Bash(sh $turns *)" "Bash(sh $linked_turns *)" "Bash($self index)" "Bash(hive index)" "Bash(date *)" \
+            "Bash($self usage)" "Bash($self usage *)" "Bash(hive usage)" "Bash(hive usage *)" \
+            </dev/null >>"$state/tidy.log" 2>&1 &
+    )
+    logline "started a $1 session: $2"
+}
+
+cmd_tidy() {
+    if [ "${1:-}" != --auto ]; then
+        command -v "$tidy_command" >/dev/null 2>&1 || die "tidy needs $tidy_command"
+        prompt="Run the consolidate-hive skill in tidy mode. The hive checkout is $hive. Reasons: $(tidy_due) $(drift_detail)"
+        # The keep-alive's problems are a tidy's now; the log keeps them.
+        date +%s >"$state/keepalive-reported"
+        cd "$hive" && exec "$tidy_command" --model "$tidy_model" "$prompt"
+    fi
+    tidy_enabled || exit 0
+    scan_usage || logline "could not record which memories sessions opened"
+    reasons=$(tidy_due)
+    if [ -n "$reasons" ] && claim_tidy; then
+        spawn_tidy tidy "Reasons: $reasons Also harvest this machine's transcripts since $(cat "$state/harvested" 2>/dev/null || echo 0) (Unix time; 0 means the last 7 days). $(drift_detail)"
+        date +%s >"$state/harvested"
+        date +%s >"$state/keepalive-reported"
+    elif harvest_due; then
+        spawn_tidy harvest "Harvest this machine's transcripts since $(cat "$state/harvested" 2>/dev/null || echo 0) (Unix time; 0 means the last 7 days)."
+        date +%s >"$state/harvested"
+    fi
+}
+
+# PreToolUse hook for Edit, Write and their kin: the checkout every session loads changes only in
+# memory/, decisions/ and worklog/; instructions, skills and the rest go through a pull request. A
+# file under ~/.claude/rules/hive or ~/.claude/skills is the checkout too. Anything unexpected
+# allows the call: a guard must never break editing elsewhere.
+cmd_guard() {
+    python3 -I -c '
+import json, os, sys
+hive = os.path.realpath(sys.argv[1])
+try:
+    call = json.load(sys.stdin)
+    args = call.get("tool_input") or {}
+    path = args.get("file_path") or args.get("notebook_path") or ""
+    if not path:
+        sys.exit(0)
+    real = os.path.realpath(os.path.expanduser(path))
+except Exception:
+    sys.exit(0)
+if real != hive and not real.startswith(hive + os.sep):
+    sys.exit(0)
+rel = os.path.relpath(real, hive)
+if rel.split(os.sep)[0] in ("memory", "decisions", "worklog"):
+    sys.exit(0)
+reason = ("%s is the hive checkout every session loads (%s). Only memory/, decisions/ and worklog/ "
+          "change there; instructions, skills and the rest change by pull request from a worktree: "
+          "git -C %s worktree add %s-<topic> -b <topic> origin/main" % (path, rel, hive, hive))
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                         "permissionDecision": "deny",
+                                         "permissionDecisionReason": reason}}))
+' "$hive"
+}
+
+cmd_usage() {
+    case "${1:-30}" in ''|*[!0-9]*) die "usage: hive usage [days]" ;; esac
+    scan_usage || say "could not read this machine's transcripts; reporting what is recorded"
+    report_usage "${1:-30}"
+}
+
+cmd_status() {
+    echo "checkout   $hive ($(current_branch) at $(g rev-parse --short HEAD))"
+    if g rev-parse -q --verify "origin/$branch" >/dev/null; then
+        g rev-list --left-right --count "HEAD...origin/$branch" |
+            awk '{ print "origin     " $1 " commit(s) to push, " $2 " to pull, as of the last fetch" }'
+    fi
+    pending=$(g status --porcelain -- memory decisions worklog | wc -l | tr -d ' ')
+    echo "pending    $pending uncommitted change(s) in memory/, decisions/ and worklog/"
+    if [ -s "$state/error" ]; then echo "error      $(cat "$state/error")"; else echo "error      none"; fi
+    echo "setup, checked against SETUP.md:"
+    setup_checks
+    [ -s "$log" ] && { echo "log        $log, last lines:"; tail -n 5 "$log" | sed 's/^/  /'; }
+    [ -s "$state/keepalive.log" ] && { echo "keep-alive $state/keepalive.log, last lines:"; tail -n 5 "$state/keepalive.log" | cut -d' ' -f2- | sed 's/^/  /'; }
+    return 0
+}
+
+# One line per check of this machine against SETUP.md: ok, fix (with the section to read), or note.
+setup_checks() {
+    # In a sandbox, agentd copies the agent's home over settings.json every 30 seconds (sandbox/README.md).
+    if [ -n "${AGENT_NAME:-}" ]; then
+        missing="; if agentd puts them back, point this agent's home at the hive's sandbox/home (\"agentctl\")"
+        stale="; if agentd puts them back, sync the hive on the host, whose sandbox/home agentd copies (\"agentctl\")"
+    else
+        missing=" (\"Your Mac\")" stale=" (\"Your Mac\")"
+    fi
+    if ! installed; then line fix "Claude Code settings do not use the hive: run $self install$missing"
+    elif ! command -v python3 >/dev/null || settings check; then line ok "Claude Code settings use the hive ($cfg/settings.json)"
+    else line fix "Claude Code settings differ from what this checkout installs: run $self install$stale"; fi
+    link_all check
+    found=$(command -v hive 2>/dev/null || true)
+    if [ -n "$found" ] && [ "$found" = "$command_link" ] && [ "$(readlink "$found")" = "$self" ]; then
+        line ok "\`hive\` runs this checkout ($found)"
+    else
+        line note "\`hive\` by name does not run this checkout; $self install links it (\"Your Mac\")"
+    fi
+    shadowed=; [ -z "$agent_skills" ] || shadowed="; this agent's own in place of the hive's:$agent_skills"
+    if [ "$conflicts" = 0 ]; then line ok "rules and skills are linked into $cfg$shadowed"
+    else line fix "$conflicts rule or skill link(s) missing or in the way: run $self install to see which"; fi
+    dups=$(duplicated_sections "$cfg/CLAUDE.md")
+    if [ -n "$dups" ]; then
+        line fix "$cfg/CLAUDE.md repeats hive sections, so they load twice: $dups (\"What goes where\")"
+    fi
+    elsewhere=$(g status --porcelain --untracked-files=no | grep -v -e ' memory/' -e ' decisions/' -e ' worklog/' | cut -c4- | paste -sd' ' -)
+    [ -z "$elsewhere" ] || line fix "uncommitted changes outside memory/, decisions/ and worklog/ stop incoming changes from landing: $elsewhere (change those by pull request)"
+    last=$(g log -1 --format=%ct -- worklog/data 2>/dev/null || true)
+    if [ -n "$last" ]; then
+        days=$(( ($(date +%s) - last) / 86400 ))
+        if [ "$days" -gt 3 ]; then line note "the Worklog backup is $days days old; a session that reads the Worklog guide refreshes it"
+        else line ok "the Worklog backup is $days day(s) old"; fi
+    fi
+    old=$(find "$cfg/projects" -path '*/memory/*.md' ! -name MEMORY.md 2>/dev/null | wc -l | tr -d ' ')
+    [ "$old" = 0 ] || line note "$old old per-project memory file(s) no longer load: import them (\"Your Mac\", Then)"
+    if [ -n "${AGENT_NAME:-}" ]; then
+        if grep -q "^## The hive on this machine$" "$cfg/CLAUDE.md" 2>/dev/null; then
+            line ok "this sandbox gets the hive's pointer from agentctl"
+        else
+            line fix "this sandbox's instructions lack the hive's pointer: list it in this agent's manifest (\"agentctl\")"
+        fi
+    fi
+    return 0
+}
+line() { printf '  %-4s  %s\n' "$1" "$2"; }
+
+# Prints the headings a CLAUDE.md shares with the hive's instructions, comma separated.
+duplicated_sections() {
+    [ -f "$1" ] || return 0
+    # Compared by text, not level: "### Gitea" in one is "## Gitea" in the other.
+    grep -h '^##* ' "$hive"/instructions/*.md 2>/dev/null | sed 's/^#* //' | sort -u >"$state/headings"
+    grep '^##* ' "$1" | sed 's/^#* //' | sort -u | grep -Fxf "$state/headings" | paste -sd, - | sed 's/,/, /g'
+    rm -f "$state/headings"
+}
+
+force=0
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "${1:-}" in --force) force=1 ;; esac
+case "$cmd" in
+    install) cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    sync) cmd_sync "$@" ;;
+    settings) cmd_settings ;;
+    save) cmd_save "$@" ;;
+    guard) cmd_guard ;;
+    tidy) cmd_tidy "$@" ;;
+    index) rebuild_index ;;
+    shape) memory_shape ;;
+    usage) cmd_usage "$@" ;;
+    cost) cmd_cost "$@" ;;
+    costs) cmd_costs "$@" ;;
+    status) cmd_status ;;
+    keepalive) cmd_keepalive "$@" ;;
+    *) sed -n '2,25p' "$self" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 2 ;;
+esac
