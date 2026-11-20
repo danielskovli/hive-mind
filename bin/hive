@@ -592,6 +592,7 @@ commit_local() {
         END { for (i = 1; i <= n; i++) printf "%s%s %s", (i > 1 ? "; " : ""), order[i],
                   (count[order[i]] > 5 ? count[order[i]] " files" : seen[order[i]]) }')
     [ "${#subject}" -le 100 ] || subject="$(printf '%s' "$subject" | cut -c1-96) …"
+    # shellcheck disable=SC2086 # folder names without spaces, one per word
     g commit -q --no-verify -m "$subject" \
         -m "Hive-Host: $(where)
 Hive-Session: ${CLAUDE_CODE_SESSION_ID:-none}" -- $ours
@@ -968,7 +969,7 @@ layers() {
 # layer, a name the highest layer that has it; drops links into the hive whose target is gone.
 link_all() {
     mode=$1
-    conflicts=0 agent_skills= claimed=" "
+    conflicts=0 agent_skills='' claimed=" "
     link "$core/instructions" "$cfg/rules/hive-mind"
     link "$hive/instructions" "$cfg/rules/hive"
     list=$(layers)
@@ -1741,6 +1742,7 @@ cmd_tidy() {
 # file under ~/.claude/rules/hive* or ~/.claude/skills is the hive too. Anything unexpected allows the
 # call: a guard must never break editing elsewhere.
 cmd_guard() {
+    # shellcheck disable=SC2016 # the backticks are Markdown in the refusal's text
     python3 -I -c '
 import json, os, sys
 hive = os.path.realpath(sys.argv[1])
