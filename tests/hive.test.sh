@@ -1116,6 +1116,26 @@ run rr sync >/dev/null 2>&1
 check "a skill of a source removed from hive.lock stops loading" "[ ! -e '$tmp/rr/cfg/skills/extra-one' ] && [ ! -L '$tmp/rr/cfg/skills/extra-one' ]"
 check "and the core's skill it shadowed takes its place" "[ \"\$(lnk rr worklog-setup)\" = '$tmp/rr/hive/hive-mind/skills/worklog-setup' ]"
 
+# hive.lock merges per source, but a replayed upgrade must not undo what a pull request did to the same
+# source meanwhile: a machine that has not synced since upgrades a source the hive dropped, or moved.
+git clone -q --bare "$tmp/remote.git" "$tmp/rt-m1.git"
+machine rm1 "$tmp/rt-m1.git" && run rm1 install >/dev/null 2>&1
+git clone -q "$tmp/rt-m1.git" "$tmp/rt-m1-pr" && sed '/^extras /d' "$tmp/rt-m1-pr/hive.lock" >"$tmp/rt-lock" &&
+    mv "$tmp/rt-lock" "$tmp/rt-m1-pr/hive.lock" && git -C "$tmp/rt-m1-pr" commit -qam "drop extras" && git -C "$tmp/rt-m1-pr" push -q origin main
+new_extras rt-one >/dev/null
+run rm1 upgrade >/dev/null 2>&1
+check "an upgrade replayed onto a lock that dropped the source leaves it dropped" "! git --git-dir='$tmp/rt-m1.git' show main:hive.lock | grep -q '^extras '"
+
+git clone -q --bare "$tmp/remote.git" "$tmp/rt-m2.git"
+git clone -q --bare "$tmp/extras.git" "$tmp/extras-fork.git"
+machine rm2 "$tmp/rt-m2.git" && run rm2 install >/dev/null 2>&1
+git clone -q "$tmp/rt-m2.git" "$tmp/rt-m2-pr" &&
+    awk -v u="$tmp/extras-fork.git" '$1 == "extras" { $2 = u } { print }' "$tmp/rt-m2-pr/hive.lock" >"$tmp/rt-lock" &&
+    mv "$tmp/rt-lock" "$tmp/rt-m2-pr/hive.lock" && git -C "$tmp/rt-m2-pr" commit -qam "extras from the fork" && git -C "$tmp/rt-m2-pr" push -q origin main
+new_extras rt-two >/dev/null
+run rm2 upgrade >/dev/null 2>&1
+check "an upgrade replayed onto a lock that moved the source keeps its new URL" "git --git-dir='$tmp/rt-m2.git' show main:hive.lock | grep -q '^extras $tmp/extras-fork.git '"
+
 # --- uninstall ------------------------------------------------------------------------------------
 
 run a uninstall >/dev/null 2>&1
