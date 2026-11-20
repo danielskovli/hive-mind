@@ -1105,6 +1105,17 @@ git clone -q "$tmp/rt-url.git" "$tmp/rt-url-pr" &&
 out=$(run ru sync 2>&1); rc=$?
 check "a source whose URL changes in hive.lock is fetched from its new URL" "[ $rc = 0 ] && [ \"\$(git -C '$tmp/ru/hive/extras' rev-parse HEAD)\" = '$moved' ] && [ \"\$(git -C '$tmp/ru/hive' rev-parse HEAD)\" = \"\$(git --git-dir='$tmp/rt-url.git' rev-parse main)\" ]"
 
+# A source removed from hive.lock by pull request runs on no machine: its skills stop loading where it
+# was cloned, as they never load on a machine set up after the removal.
+git clone -q --bare "$tmp/remote.git" "$tmp/rt-rm.git"
+machine rr "$tmp/rt-rm.git" && run rr install >/dev/null 2>&1
+check "a source's skill is linked before the source is removed" "[ \"\$(lnk rr extra-one)\" = '$tmp/rr/hive/extras/skills/extra-one' ]"
+git clone -q "$tmp/rt-rm.git" "$tmp/rt-rm-pr" && sed '/^extras /d' "$tmp/rt-rm-pr/hive.lock" >"$tmp/rt-lock" &&
+    mv "$tmp/rt-lock" "$tmp/rt-rm-pr/hive.lock" && git -C "$tmp/rt-rm-pr" commit -qam "drop extras" && git -C "$tmp/rt-rm-pr" push -q origin main
+run rr sync >/dev/null 2>&1
+check "a skill of a source removed from hive.lock stops loading" "[ ! -e '$tmp/rr/cfg/skills/extra-one' ] && [ ! -L '$tmp/rr/cfg/skills/extra-one' ]"
+check "and the core's skill it shadowed takes its place" "[ \"\$(lnk rr worklog-setup)\" = '$tmp/rr/hive/hive-mind/skills/worklog-setup' ]"
+
 # --- uninstall ------------------------------------------------------------------------------------
 
 run a uninstall >/dev/null 2>&1
