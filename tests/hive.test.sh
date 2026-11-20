@@ -1090,6 +1090,21 @@ check "status flags lock lines that are not sources" "run w status | grep -q '^ 
 mkdir -p "$tmp/lone/core" && cp -R "$root/bin" "$tmp/lone/core/"
 check "a core outside a hive refuses to run, saying why" "! '$tmp/lone/core/bin/hive' status >/dev/null 2>&1 && '$tmp/lone/core/bin/hive' status 2>&1 | grep -q 'not inside a hive: there is no hive.lock'"
 
+# A source that moves to a new URL (a fork, a transferred repository), by pull request in the hive: every
+# machine fetches the new pin from the new URL, not from the clone's old origin.
+git clone -q --bare "$tmp/remote.git" "$tmp/rt-url.git"
+git clone -q --bare "$tmp/extras.git" "$tmp/extras-moved.git"
+machine ru "$tmp/rt-url.git" && run ru install >/dev/null 2>&1
+rm -rf "$tmp/x" && git clone -q "$tmp/extras-moved.git" "$tmp/x" && mkdir -p "$tmp/x/skills/moved-skill" &&
+    printf -- '---\nname: moved-skill\ndescription: from the moved extras\n---\nx\n' >"$tmp/x/skills/moved-skill/SKILL.md" &&
+    git -C "$tmp/x" add -A && git -C "$tmp/x" commit -qm "only in the new home" && git -C "$tmp/x" push -q origin main
+moved=$(git -C "$tmp/x" rev-parse HEAD)
+git clone -q "$tmp/rt-url.git" "$tmp/rt-url-pr" &&
+    awk -v u="$tmp/extras-moved.git" -v s="$moved" '$1 == "extras" { $2 = u; $3 = s } { print }' "$tmp/rt-url-pr/hive.lock" >"$tmp/rt-lock" &&
+    mv "$tmp/rt-lock" "$tmp/rt-url-pr/hive.lock" && git -C "$tmp/rt-url-pr" commit -qam "extras moves" && git -C "$tmp/rt-url-pr" push -q origin main
+out=$(run ru sync 2>&1); rc=$?
+check "a source whose URL changes in hive.lock is fetched from its new URL" "[ $rc = 0 ] && [ \"\$(git -C '$tmp/ru/hive/extras' rev-parse HEAD)\" = '$moved' ] && [ \"\$(git -C '$tmp/ru/hive' rev-parse HEAD)\" = \"\$(git --git-dir='$tmp/rt-url.git' rev-parse main)\" ]"
+
 # --- uninstall ------------------------------------------------------------------------------------
 
 run a uninstall >/dev/null 2>&1
