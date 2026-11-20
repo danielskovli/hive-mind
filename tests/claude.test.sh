@@ -8,11 +8,13 @@
 # model, default claude-sonnet-5-5: Haiku passes the rest but follows the host-wide pointer unprompted
 # only now and then (1 run in 4 on 2026-10-25), while Sonnet (2 runs) and Opus (1) did each time.
 # Built from the working tree, like hive.test.sh.
+# shellcheck disable=SC2015,SC2030,SC2031 # `test && ok || fail`; AGENT_NAME set per session, in subshells
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 model=${HIVE_TEST_MODEL:-claude-sonnet-5-5}
-# Some sessions here run with permissions skipped, which company policy allows only inside a sandbox.
+# Some sessions here run with permissions skipped, so they can write memory and try the guard unattended:
+# only inside a sandbox, where nothing they do can reach the machine running them.
 [ -n "${AGENT_NAME:-}" ] || { echo "skip: runs Claude with permissions skipped; only inside an agentctl sandbox"; exit 0; }
 creds="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 [ -f "$creds" ] || { echo "skip: no credentials file at $creds"; exit 0; }
