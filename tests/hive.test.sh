@@ -382,7 +382,7 @@ check "a lock left by a dead process is broken" "on_remote show main:memory/feed
 sleep 30 & alive=$!
 printf '%s-1-1\n' "$alive" >"$a/hive/.git/hive/lock"
 t0=$(date +%s); out=$(run a sync --hook 2>&1); t1=$(date +%s)
-check "a lock held by a live process is respected, and a session start waits only briefly" "[ -z \"\$out\" ] && [ \$((t1 - t0)) -le 7 ] && grep -q '^$alive-' '$a/hive/.git/hive/lock'"
+check "a lock held by a live process is respected, and a session start waits only briefly ($((t1 - t0))s)" "[ -z \"\$out\" ] && [ \$((t1 - t0)) -le 7 ] && grep -q '^$alive-' '$a/hive/.git/hive/lock'"
 kill "$alive" 2>/dev/null; wait "$alive" 2>/dev/null; rm -f "$a/hive/.git/hive/lock"
 
 # SIGTERM (a hook's timeout) stops the run and frees the lock; it does not carry on unlocked.
