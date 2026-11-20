@@ -1,0 +1,29 @@
+name: check
+
+# Every offline check, on Linux (dash) and macOS (bash as /bin/sh): the core's own checks, and the
+# scenarios against a hive built from template/.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends dash shellcheck jq
+      - run: sh tests/check.sh
