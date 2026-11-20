@@ -20,26 +20,27 @@ line it marks `fix`.
 
 ## The sandbox's settings
 
-`home/` here is the home your variant gives each agent. agentd copies it over `/home/agent` when the
-agent starts and again every 30 seconds, replacing each file it holds. Its one file,
-`.claude/settings.json`, is exactly what `hive install` writes in a sandbox whose hive is at
-`/home/agent/hive`, and a test keeps the two equal. So a sandbox has the hive's settings from its first
-second, and nothing an agent's own home holds can undo them. Anything else put in `home/` lands in every
-such sandbox.
+The home your variant gives each agent is the hive's `sandbox/home/`, which `hive install` and every sync
+write on the host, outside the hive's history. agentd copies it over `/home/agent` when the agent starts
+and again every 30 seconds, replacing each file it holds. Its one file, `.claude/settings.json`, is
+exactly what `hive install` writes in a sandbox whose hive is at `/home/agent/hive`, the hive's own
+`settings.json` keys included, and a test keeps the two equal. So a sandbox has the hive's settings from
+its first second, and nothing an agent's own home holds can undo them; a sandbox never writes its
+settings itself.
 
 Until the first session has cloned the hive, those settings name a `bin/hive` that is not there yet:
 each hook fails "with non-blocking status code", and the session carries on. Claude Code creates the
 memory directory, `~/hive/memory`, on the first prompt, and a clone into a directory that is not empty
 fails, so the pointer removes the two while they are empty.
 
-agentd reads `home/` from the host's hive, at the core it pins, while each sandbox runs its own core. A
-change to the settings reaches sandboxes once the host's hive syncs, and `hive status` in a sandbox says
-when the settings and its core disagree.
+agentd reads the home from the host's hive, while each sandbox runs its own checkout. A change to the
+settings reaches sandboxes once the host's hive syncs, and `hive status` in a sandbox says when the
+settings and its checkout disagree.
 
 ## Setting it up
 
 `SETUP.md`, section "agentctl": in your variant of each agent, list the hive's
-`sandbox/host-instructions.md` and point the agent's home at this `home/`. Give the agent's GitHub
+`sandbox/host-instructions.md` and point the agent's home at the hive's `sandbox/home/`. Give the agent's GitHub
 account push access to the hive. `hive status`, inside a sandbox, checks that it got the pointer and that
 its settings match its core.
 

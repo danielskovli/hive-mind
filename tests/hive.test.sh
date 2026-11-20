@@ -103,7 +103,6 @@ check "install adds one SessionStart hook" "settings_has \"[h['command'] for g i
 check "install adds Stop and SessionEnd hooks" "settings_has \"any(h['command'].endswith('save --background') for g in s['hooks']['Stop'] for h in g['hooks']) and len(s['hooks']['SessionEnd']) == 1\""
 check "install adds the keep-alive: an asyncRewake Stop hook that outlasts its wait, a prompt and an end hook" "settings_has \"[(h.get('asyncRewake'), h['timeout']) for g in s['hooks']['Stop'] for h in g['hooks'] if h['command'].endswith(' keepalive stop')] == [(True, 7200)] and any(h['command'].endswith(' keepalive prompt') for g in s['hooks']['UserPromptSubmit'] for h in g['hooks']) and any(h['command'].endswith(' keepalive end') for g in s['hooks']['SessionEnd'] for h in g['hooks'])\""
 check "install keeps other settings and hooks" "settings_has \"s['modelSettings'] == {'x': {'effortLevel': 'high'}} and s['hooks']['Stop'][0]['hooks'][0]['command'] == 'echo other'\""
-check "install blanks attribution in commits and pull requests" "settings_has \"s['attribution'] == {'commit': '', 'pr': ''}\""
 cp "$a/cfg/settings.json" "$tmp/settings.first"
 run a install >/dev/null 2>&1
 check "install is idempotent" "cmp -s '$tmp/settings.first' '$a/cfg/settings.json'"
@@ -319,7 +318,6 @@ run a save >/dev/null 2>&1
 check "auto-dream's lock is not committed" "! on_remote show main:memory/.consolidate-lock >/dev/null 2>&1"
 check "install turns auto-dream off" "python3 -c \"import json,sys; sys.exit(json.load(open(sys.argv[1])).get('autoDreamEnabled') is not False)\" '$a/cfg/settings.json'"
 check "install turns idle compaction off" "python3 -c \"import json,sys; sys.exit(json.load(open(sys.argv[1])).get('idleCompaction') is not False)\" '$a/cfg/settings.json'"
-check "install turns the session recap off" "python3 -c \"import json,sys; sys.exit(json.load(open(sys.argv[1])).get('awaySummaryEnabled') is not False)\" '$a/cfg/settings.json'"
 
 # A refresh of the Worklog backup that comes back mostly empty does not replace the backup.
 mkdir -p "$a/hive/worklog/data/items"
@@ -509,14 +507,13 @@ mkdir -p "$tmp/e/home/hive/memory"
 HOME="$tmp/e/home" CLAUDE_CONFIG_DIR="$tmp/e/home/.claude" sh "$tmp/pointer.sh" >/dev/null 2>&1; rc=$?
 check "the pointer's snippet clones over the empty memory directory Claude Code made" "[ $rc = 0 ] && [ -L '$tmp/e/home/.claude/rules/hive' ]"
 
-# agentd copies sandbox/home over a sandbox's home every 30 seconds, so its settings must be what install
-# writes there, or the two undo each other.
+# agentd copies the hive's sandbox/home over a sandbox's home every 30 seconds, so its settings must be
+# what install writes there, or the two undo each other.
 machine h
 run h install >/dev/null 2>&1
 sed "s|$tmp/h/hive|/home/agent/hive|g" "$tmp/h/cfg/settings.json" >"$tmp/h/sandbox-settings.json"
-check "sandbox/home's settings are what install writes in a sandbox" "cmp -s '$tmp/h/sandbox-settings.json' '$root/sandbox/home/.claude/settings.json'"
-cmp -s "$tmp/h/sandbox-settings.json" "$root/sandbox/home/.claude/settings.json" \
-    || { echo "     sandbox/home/.claude/settings.json should read:"; sed 's/^/     /' "$tmp/h/sandbox-settings.json"; }
+check "install writes the sandboxes' home: what install writes in a sandbox" "cmp -s '$tmp/h/sandbox-settings.json' '$tmp/h/hive/sandbox/home/.claude/settings.json'"
+check "and keeps it out of the hive's history" "[ -z \"\$(git -C '$tmp/h/hive' status --porcelain)\" ]"
 
 # In a sandbox, a skill the agent's definition ships wins over the hive's of the same name: agentd's,
 # even with --force, and no conflict.
@@ -561,11 +558,11 @@ check "the pointer is not mistaken for a duplicate" "! AGENT_NAME=x run a status
 cp "$a/cfg/settings.json" "$tmp/settings.installed"
 python3 -c "import json,sys; p=sys.argv[1]; s=json.load(open(p)); s['hooks']['Stop'].reverse(); json.dump(s, open(p, 'w'))" "$a/cfg/settings.json"
 check "status ignores where the hive's hooks sit among others" "run a status | grep -q '^  ok    Claude Code settings use the hive'"
-python3 -c "import json,sys; p=sys.argv[1]; s=json.load(open(p)); del s['attribution']; json.dump(s, open(p, 'w'))" "$a/cfg/settings.json"
-check "status flags settings older than the checkout" "run a status | grep -q '^  fix   Claude Code settings differ from what this checkout installs: run .* install (\"A machine\")'"
+python3 -c "import json,sys; p=sys.argv[1]; s=json.load(open(p)); del s['idleCompaction']; json.dump(s, open(p, 'w'))" "$a/cfg/settings.json"
+check "status flags settings older than the checkout" "run a status | grep -q '^  fix   Claude Code settings differ from what this hive installs: run .* install (\"A machine\")'"
 check "in a sandbox, status says to sync the hive on the host" "AGENT_NAME=x run a status | grep -q 'sync the hive on the host'"
-echo '{"attribution": {"commit": "", "pr": ""}}' >"$a/cfg/settings.json"
-check "in a sandbox, status names the agent's home when the settings lack the hive" "AGENT_NAME=x run a status | grep -q '^  fix   Claude Code settings do not use the hive: .*point this agent.s home at the core.s sandbox/home'"
+echo '{"theme": "dark"}' >"$a/cfg/settings.json"
+check "in a sandbox, status names the agent's home when the settings lack the hive" "AGENT_NAME=x run a status | grep -q '^  fix   Claude Code settings do not use the hive: .*point this agent.s home at the hive.s sandbox/home'"
 cp "$tmp/settings.installed" "$a/cfg/settings.json"
 
 # --- sync keeps the settings up to what the checkout installs ---------------------------------------
@@ -579,14 +576,14 @@ inode() { ls -i "$1" | awk '{ print $1 }'; }
 before=$(inode "$a/cfg/settings.json")
 out=$(run a sync --hook 2>&1)
 check "a sync leaves current settings untouched" "[ \"\$(inode '$a/cfg/settings.json')\" = '$before' ] && cmp -s '$tmp/settings.installed' '$a/cfg/settings.json'"
-drop awaySummaryEnabled PreToolUse
+drop autoDreamEnabled PreToolUse
 out=$(run a sync --hook 2>&1)
-check "a session-start sync puts back what install writes" "settings_has \"s['awaySummaryEnabled'] is False and any(h['command'].endswith(' guard') for g in s['hooks']['PreToolUse'] for h in g['hooks'])\""
+check "a session-start sync puts back what install writes" "settings_has \"s['autoDreamEnabled'] is False and any(h['command'].endswith(' guard') for g in s['hooks']['PreToolUse'] for h in g['hooks'])\""
 check "and keeps other settings and hooks" "settings_has \"s['modelSettings'] == {'x': {'effortLevel': 'high'}} and any(h['command'] == 'echo other' for g in s['hooks']['Stop'] for h in g['hooks'])\""
-check "and tells the session nothing, but logs what changed" "[ -z \"\$out\" ] && grep -q 'updated .*settings.json .*(awaySummaryEnabled, PreToolUse hooks)' '$a/hive/.git/hive/log'"
+check "and tells the session nothing, but logs what changed" "[ -z \"\$out\" ] && grep -q 'updated .*settings.json .*(autoDreamEnabled, PreToolUse hooks)' '$a/hive/.git/hive/log'"
 drop idleCompaction
 out=$(run a sync 2>&1)
-check "a sync run by hand says what it updated" "printf '%s' \"\$out\" | grep -q '^hive: updated .*settings.json to what this checkout installs (idleCompaction)'"
+check "a sync run by hand says what it updated" "printf '%s' \"\$out\" | grep -q '^hive: updated .*settings.json to what this hive installs (idleCompaction)'"
 drop idleCompaction
 out=$(export AGENT_NAME=x; run a sync --hook 2>&1)
 check "in a sandbox, sync leaves the settings to agentd" "[ -z \"\$out\" ] && ! settings_has \"'idleCompaction' in s\""
@@ -609,7 +606,7 @@ git clone -q "$tmp/remote2.git" "$tmp/w2" && sed "s|$tmp/core.git|$tmp/core2.git
 machine u "$tmp/remote2.git" && machine v "$tmp/remote2.git"
 run u install >/dev/null 2>&1
 git clone -q "$tmp/core2.git" "$tmp/c2"
-python3 -c "import sys; p=sys.argv[1]; s=open(p).read(); old='    s[\"awaySummaryEnabled\"] = False\n'; assert old in s
+python3 -c "import sys; p=sys.argv[1]; s=open(p).read(); old='    s[\"idleCompaction\"] = False\n'; assert old in s
 s = s.replace(old, old + '    s[\"hiveTestKey\"] = True\n')
 # Shift everything after the header, so a run that read on from the new file would land mid-line.
 s = s.replace('set -eu\n', '#' + 'x' * 199 + '\n' * 1 + ('#' + 'y' * 99 + '\n') * 80 + 'set -eu\n', 1)
@@ -1016,7 +1013,7 @@ git clone -q "$tmp/remote.git" "$tmp/pr3" && git -C "$tmp/pr3" rm -q -r skills/s
 run a sync >/dev/null 2>&1
 check "when the hive drops a skill, the next layer's takes its place" "[ \"\$(lnk a shared)\" = '$a/hive/extras/skills/shared' ]"
 machine ag && mkdir -p "$tmp/ag/cfg/skills/extra-one" && echo "agentd's copy" >"$tmp/ag/cfg/skills/extra-one/SKILL.md"
-AGENT_NAME=x run ag install --force >/dev/null 2>&1
+as x run ag install --force >/dev/null 2>&1
 check "in a sandbox, the agent's own skill wins over a source's too" "[ ! -L '$tmp/ag/cfg/skills/extra-one' ] && grep -q \"agentd's copy\" '$tmp/ag/cfg/skills/extra-one/SKILL.md'"
 
 # new_extras <skill>: a new commit in the extras source, adding a skill; prints the commit.
@@ -1135,6 +1132,49 @@ git clone -q "$tmp/rt-m2.git" "$tmp/rt-m2-pr" &&
 new_extras rt-two >/dev/null
 run rm2 upgrade >/dev/null 2>&1
 check "an upgrade replayed onto a lock that moved the source keeps its new URL" "git --git-dir='$tmp/rt-m2.git' show main:hive.lock | grep -q '^extras $tmp/extras-fork.git '"
+
+# A hive's own settings.json: its keys merge into Claude Code's settings wherever the hive installs, an
+# object key by key; the engine's keys win; every sync puts them back; uninstall takes back only those
+# still at the hive's values; and sandboxes get them through the home the host writes.
+git clone -q --bare "$tmp/remote.git" "$tmp/hs.git"
+git clone -q "$tmp/hs.git" "$tmp/hs-pr" &&
+    printf '{"awaySummaryEnabled": false, "attribution": {"commit": "", "pr": ""}, "theme": "dark", "autoDreamEnabled": true}\n' >"$tmp/hs-pr/settings.json" &&
+    git -C "$tmp/hs-pr" add settings.json && git -C "$tmp/hs-pr" commit -qm "my settings" && git -C "$tmp/hs-pr" push -q origin main
+machine sa "$tmp/hs.git"
+printf '{"attribution": {"sessionUrl": "kept"}, "model": "mine"}\n' >"$tmp/sa/cfg/settings.json"
+run sa install >/dev/null 2>&1
+sa_has() { python3 -c "import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if ($1) else 1)" "$tmp/sa/cfg/settings.json"; }
+check "the hive's settings.json merges into Claude Code's settings" "sa_has \"s['theme'] == 'dark' and s['awaySummaryEnabled'] is False and s['model'] == 'mine'\""
+check "an object in it merges key by key" "sa_has \"s['attribution'] == {'sessionUrl': 'kept', 'commit': '', 'pr': ''}\""
+check "a key the engine owns keeps the engine's value" "sa_has \"s['autoDreamEnabled'] is False\""
+check "and status says so" "run sa status | grep -q '^  note  the hive.s settings.json sets autoDreamEnabled, which the engine owns'"
+python3 -c "import json,sys; p=sys.argv[1]; s=json.load(open(p)); s['theme'] = 'light'; json.dump(s, open(p, 'w'))" "$tmp/sa/cfg/settings.json"
+run sa sync >/dev/null 2>&1
+check "a sync puts back a hive key the user changed" "sa_has \"s['theme'] == 'dark'\""
+cp "$tmp/sa/cfg/settings.json" "$tmp/sa-before.json"
+printf '{"theme": "dark",\n' >"$tmp/hs-pr/settings.json" && git -C "$tmp/hs-pr" commit -qam "broken settings" && git -C "$tmp/hs-pr" push -q origin main
+out=$(run sa sync 2>&1)
+check "an invalid settings.json is reported and leaves Claude Code's settings alone" "printf '%s' \"\$out\" | grep -q 'settings.json is not valid JSON.*settings are unchanged' && cmp -s '$tmp/sa-before.json' '$tmp/sa/cfg/settings.json'"
+check "install refuses it too, changing nothing" "! run sa install >/dev/null 2>&1 && cmp -s '$tmp/sa-before.json' '$tmp/sa/cfg/settings.json'"
+check "and status flags it" "run sa status | grep -q '^  fix   .*settings.json is not valid JSON'"
+git -C "$tmp/hs-pr" revert --no-edit HEAD >/dev/null && git -C "$tmp/hs-pr" push -q origin main && run sa sync >/dev/null 2>&1
+
+# A sandbox: agentd copies the host's generated home over it, and its own sync leaves that alone.
+sb_home="$tmp/sa/hive/sandbox/home/.claude/settings.json"
+check "the sandboxes' home carries the hive's keys" "python3 -c \"import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if s['theme'] == 'dark' and s['autoDreamEnabled'] is False and s['autoMemoryDirectory'] == '/home/agent/hive/memory' else 1)\" '$sb_home'"
+machine sb "$tmp/hs.git" && sed "s|/home/agent/hive|$tmp/sb/hive|g" "$sb_home" >"$tmp/sb/cfg/settings.json"
+as x run sb install >/dev/null 2>&1
+python3 -c "import json,sys; p=sys.argv[1]; s=json.load(open(p)); s['theme'] = 'agentd'; json.dump(s, open(p, 'w'))" "$tmp/sb/cfg/settings.json"
+cp "$tmp/sb/cfg/settings.json" "$tmp/sb-agentd.json"
+out=$(AGENT_NAME=x run sb sync --hook 2>&1)
+check "and the sandbox's sync leaves them to agentd" "cmp -s '$tmp/sb-agentd.json' '$tmp/sb/cfg/settings.json'"
+sed "s|/home/agent/hive|$tmp/sb/hive|g" "$sb_home" >"$tmp/sb/cfg/settings.json"
+check "in a sandbox, the settings from the home are what the hive installs" "AGENT_NAME=x run sb status | grep -q '^  ok    Claude Code settings use the hive'"
+
+python3 -c "import json,sys; p=sys.argv[1]; s=json.load(open(p)); s['awaySummaryEnabled'] = True; json.dump(s, open(p, 'w'))" "$tmp/sa/cfg/settings.json"
+run sa uninstall >/dev/null 2>&1
+check "uninstall takes back the hive's keys still at its values" "! sa_has \"'theme' in s\" && sa_has \"s['attribution'] == {'sessionUrl': 'kept'}\""
+check "and leaves the ones the user changed, and the user's own" "sa_has \"s['awaySummaryEnabled'] is True and s['model'] == 'mine'\""
 
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"

@@ -495,8 +495,9 @@ pin_lines() {
 }
 short() { printf '%.7s' "$1"; }
 
-# Keeps a source's clone out of the hive's history, beside the hive's own .gitignore.
-exclude_source() {
+# Keeps a folder the engine makes (a source's clone, the sandboxes' home) out of the hive's history,
+# beside the hive's own .gitignore.
+exclude_path() {
     f=$(g rev-parse --git-path info/exclude)
     case "$f" in /*) ;; *) f="$hive/$f" ;; esac
     mkdir -p "$(dirname "$f")"
@@ -528,7 +529,7 @@ sources_fetch() {
                 fail_with "source $name: could not clone $url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
                 return 1
             fi
-            exclude_source "$name"
+            exclude_path "$name"
         fi
         # The lock's URL is where the source lives now (a fork, a moved repository), whatever the clone
         # was made from.
@@ -1033,16 +1034,32 @@ unlink_all() {
 
 # --- settings ---------------------------------------------------------------------------------------
 
-# Adds or removes the hive's keys in Claude Code's user settings, keeping everything else. `check`
-# writes nothing and fails when installing would change the hive's keys. `update` installs only when
-# that would change something, prints what changed, and leaves an autoMemoryDirectory pointed elsewhere
-# alone.
+# Adds or removes the engine's keys and the hive's own (its settings.json) in Claude Code's user settings,
+# keeping everything else: settings <mode> [file] [command] [memory directory], by default this machine's.
+# `check` writes nothing and fails when installing would change them. `update` installs only when that
+# would change something, prints what changed, and leaves an autoMemoryDirectory pointed elsewhere alone.
+# `owned` prints the keys of the hive's settings.json that the engine owns, and so overrides.
 settings() {
-    python3 -I - "$1" "$cfg/settings.json" "$self" "$hive/memory" "$force" <<'EOF'
+    python3 -I - "$1" "${2:-$cfg/settings.json}" "${3:-$self}" "${4:-$hive/memory}" "$force" "$hive/settings.json" <<'EOF'
 import json, os, shlex, sys, tempfile
 
-mode, path, cmd, memdir, force = sys.argv[1:6]
+mode, path, cmd, memdir, force, hivefile = sys.argv[1:7]
 quoted = shlex.quote(cmd)
+# The engine's keys win over the hive's: memory, the tidy and the keep-alive depend on them.
+owned = ("autoMemoryDirectory", "autoDreamEnabled", "idleCompaction", "hooks")
+try:
+    with open(hivefile) as f:
+        theirs = json.load(f)
+except FileNotFoundError:
+    theirs = {}
+except ValueError as e:
+    sys.exit(f"hive: {hivefile} is not valid JSON ({e}); Claude Code's settings are unchanged. Fix it by pull request")
+if not isinstance(theirs, dict):
+    sys.exit(f"hive: {hivefile} must hold one JSON object; Claude Code's settings are unchanged. Fix it by pull request")
+if mode == "owned":
+    print(", ".join(k for k in owned if k in theirs))
+    sys.exit(0)
+hive_keys = {k: v for k, v in theirs.items() if k not in owned}
 ours = {
     "SessionStart": {"hooks": [{"type": "command", "command": quoted + " sync --hook", "timeout": 30}]},
     "PreToolUse": {"matcher": "Edit|Write|MultiEdit|NotebookEdit",
@@ -1092,19 +1109,29 @@ if mode in ("install", "check", "update"):
     # whichever machine it ran on; the hive's tidy does that job.
     s["autoDreamEnabled"] = False
     # Idle compaction would summarise a long session just before the keep-alive's first ping, which
-    # keeps long sessions whole on purpose; the recap Claude Code writes into the chat on a return goes
-    # with it.
+    # keeps long sessions whole on purpose.
     s["idleCompaction"] = False
-    s["awaySummaryEnabled"] = False
-    # Agents commit and open pull requests under their own accounts: no model is named in commits or
-    # pull request descriptions, on any machine.
-    attribution = s.get("attribution") if isinstance(s.get("attribution"), dict) else {}
-    attribution.update(commit="", pr="")
-    s["attribution"] = attribution
     for event, group in ours.items():
         hooks.setdefault(event, []).append(group)
+    # The hive's own keys; an object merges key by key, keeping the user's other keys in it.
+    for k, v in hive_keys.items():
+        if isinstance(v, dict) and isinstance(s.get(k), dict):
+            s[k] = {**s[k], **json.loads(json.dumps(v))}
+        else:
+            s[k] = json.loads(json.dumps(v))
 elif current == memdir:
     del s["autoMemoryDirectory"]
+    # The hive's own keys go where they still hold the hive's values; a key the user changed stays.
+    for k, v in hive_keys.items():
+        if isinstance(v, dict) and isinstance(s.get(k), dict):
+            for sk, sv in v.items():
+                if sk in s[k] and s[k][sk] == sv:
+                    del s[k][sk]
+            if not s[k]:
+                del s[k]
+        elif k in s and s[k] == v:
+            del s[k]
+    # awaySummaryEnabled and the attribution blanks are what installs before hive settings set.
     for key in ("autoDreamEnabled", "idleCompaction", "awaySummaryEnabled"):
         if s.get(key) is False:
             del s[key]
@@ -1151,16 +1178,30 @@ installed() {
     [ -f "$cfg/settings.json" ] && grep -qF "$self" "$cfg/settings.json"
 }
 
-# Brings the hive's keys in the settings up to what this checkout installs, on a machine that has
-# installed this checkout. Sync runs it after every merge, as a fresh process, so the script just pulled
-# decides what that is. Not in a sandbox: agentd copies the agent's home over the settings every 30
-# seconds, so they are its, and writing them would hide from `hive status` a home that is not the
-# hive's (sandbox/README.md).
+# Brings the engine's and the hive's keys in the settings up to what this hive installs, on a machine
+# that has installed it, and writes the sandboxes' home to match. Sync runs it after every merge, as a
+# fresh process, so the core just checked out decides what that is. Not in a sandbox: agentd copies the
+# agent's home over the settings every 30 seconds, so they are its, and writing them would hide from
+# `hive status` a home that is not the hive's (sandbox/README.md).
 cmd_settings() {
     [ -z "${AGENT_NAME:-}" ] || return 0
     installed && command -v python3 >/dev/null || return 0
     changed=$(settings update)
-    [ -z "$changed" ] || say "updated $cfg/settings.json to what this checkout installs ($changed); sessions started from now on use it"
+    [ -z "$changed" ] || say "updated $cfg/settings.json to what this hive installs ($changed); sessions started from now on use it"
+    sandbox_home
+}
+
+# The home your variant gives each agentctl sandbox (SETUP.md, "agentctl"): its .claude/settings.json is
+# what install writes in a sandbox whose hive is /home/agent/hive, the hive's own keys included. agentd
+# copies it over the sandbox's home every 30 seconds, from this machine's hive, so a sandbox has the
+# hive's settings without ever writing them. Kept out of the hive's history: it is derived.
+sandbox_home() {
+    f="$hive/sandbox/home/.claude/settings.json"
+    mkdir -p "$(dirname "$f")"
+    rm -f "$f.new"
+    settings install "$f.new" /home/agent/hive/hive-mind/bin/hive /home/agent/hive/memory >/dev/null || { rm -f "$f.new"; return 1; }
+    if cmp -s "$f.new" "$f"; then rm -f "$f.new"; else mv "$f.new" "$f"; fi
+    exclude_path sandbox/home
 }
 
 # --- commands ---------------------------------------------------------------------------------------
@@ -1175,6 +1216,8 @@ cmd_install() {
     link_all report
     settings install
     say "settings: autoMemoryDirectory is $hive/memory; SessionStart, UserPromptSubmit, PreToolUse, Stop and SessionEnd hooks run $self"
+    [ -f "$hive/settings.json" ] && say "settings: the hive's own keys from $hive/settings.json"
+    [ -n "${AGENT_NAME:-}" ] || sandbox_home || say "could not write the sandboxes' home, $hive/sandbox/home"
     rebuild_index
     link_command
     old=$(find "$cfg/projects" -path '*/memory/*.md' ! -name MEMORY.md 2>/dev/null | wc -l | tr -d ' ')
@@ -1880,8 +1923,8 @@ cmd_status() {
 setup_checks() {
     # In a sandbox, agentd copies the agent's home over settings.json every 30 seconds (sandbox/README.md).
     if [ -n "${AGENT_NAME:-}" ]; then
-        missing="; if agentd puts them back, point this agent's home at the core's sandbox/home (\"agentctl\")"
-        stale="; if agentd puts them back, sync the hive on the host, whose core's sandbox/home agentd copies (\"agentctl\")"
+        missing="; if agentd puts them back, point this agent's home at the hive's sandbox/home (\"agentctl\")"
+        stale="; if agentd puts them back, sync the hive on the host, whose sandbox/home agentd copies (\"agentctl\")"
     else
         missing=" (\"A machine\")" stale=" (\"A machine\")"
     fi
@@ -1896,8 +1939,12 @@ setup_checks() {
     bad=$(g show HEAD:hive.lock 2>/dev/null | pin_lines invalid | paste -sd'|' - | sed 's/|/ | /g')
     [ -z "$bad" ] || line fix "hive.lock has lines that are not \"<name> <url> <commit>\" (or name a folder the hive uses), and are ignored: $bad"
     if ! installed; then line fix "Claude Code settings do not use the hive: run $self install$missing"
-    elif ! command -v python3 >/dev/null || settings check; then line ok "Claude Code settings use the hive ($cfg/settings.json)"
-    else line fix "Claude Code settings differ from what this checkout installs: run $self install$stale"; fi
+    elif ! command -v python3 >/dev/null || settings check 2>/dev/null; then line ok "Claude Code settings use the hive ($cfg/settings.json)"
+    else line fix "Claude Code settings differ from what this hive installs: run $self install$stale"; fi
+    if [ -f "$hive/settings.json" ] && command -v python3 >/dev/null; then
+        if ! owned=$(settings owned 2>&1); then line fix "${owned#hive: }"
+        elif [ -n "$owned" ]; then line note "the hive's settings.json sets $owned, which the engine owns: the engine's values stand"; fi
+    fi
     link_all check
     found=$(command -v hive 2>/dev/null || true)
     if [ -n "$found" ] && [ "$found" = "$command_link" ] && [ "$(readlink "$found")" = "$self" ]; then
