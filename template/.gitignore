@@ -1,0 +1,13 @@
+# Derived from the memory files' frontmatter on every sync (hive index).
+memory/MEMORY.md
+memory/.MEMORY.md.*
+
+# The sources hive.lock pins, each a clone kept out of this repository's history. Sync adds any other
+# source to .git/info/exclude when it clones one.
+/hive-mind/
+/agent-skills/
+
+.DS_Store
+__pycache__/
+memory/.consolidate-lock
+memory/.usage/.*

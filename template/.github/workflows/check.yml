@@ -1,0 +1,59 @@
+name: check
+
+# Pull requests run every offline check of the core this hive pins, against this hive. main is pushed
+# to after every agent's turn, so it is checked once a day instead, for what must hold however it got
+# there; GitHub tells you when that fails.
+on:
+  pull_request:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The core this hive pins
+        run: |
+          set -- $(awk '!/^[[:space:]]*(#|$)/ { print $2, $3; exit }' hive.lock)
+          git clone -q "$1" hive-mind && git -C hive-mind checkout -q --detach "$2"
+      - run: sudo apt-get install -y --no-install-recommends dash shellcheck jq
+      - run: HIVE_TEST_HIVE="$GITHUB_WORKSPACE" sh hive-mind/tests/check.sh
+
+  invariants:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The core this hive pins
+        run: |
+          set -- $(awk '!/^[[:space:]]*(#|$)/ { print $2, $3; exit }' hive.lock)
+          git clone -q "$1" hive-mind && git -C hive-mind checkout -q --detach "$2"
+      - run: sh hive-mind/tests/invariants.sh
+      - name: Only memory, decisions, the Worklog backup and hive.lock change outside pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bad=""
+          for sha in $(git rev-list --since="1 day ago" --no-merges HEAD); do
+            outside=$(git show --name-only --format= "$sha" | grep -v -e '^memory/' -e '^decisions/' -e '^worklog/' -e '^hive\.lock$' || true)
+            [ -n "$outside" ] || continue
+            prs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq 'length')
+            [ "$prs" != 0 ] || bad="$bad $sha"
+          done
+          if [ -n "$bad" ]; then
+            echo "Commits on main that change more than memory/, decisions/, worklog/ and hive.lock without a pull request:$bad"
+            exit 1
+          fi

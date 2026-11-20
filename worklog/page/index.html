@@ -1,0 +1,41 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Worklog</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="worklog.css">
+<!-- For agents: this is the user's task tracker. Before you read or write its data, read the document
+     meta/agent-guide in this artifact's database and follow it. -->
+<header class="top"><div class="top-in gut">
+  <div class="row1">
+    <div class="brand"><h1>Worklog</h1><span class="stamp" id="stamp"></span></div>
+    <div class="search-w"><input id="q" class="search" type="search" placeholder="Search" aria-label="Search items"><kbd>/</kbd></div>
+    <button class="btn2" id="guideBtn" title="The rules every Claude follows when it uses this tracker">For agents</button>
+    <a class="btn2" id="hiveLink" href="https://github.com/OWNER/hive" target="_blank" rel="noopener" title="The hive: the instructions, skills and memory every Claude shares">GitHub <span aria-hidden="true">&#8599;</span></a>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button class="tab" role="tab" data-view="inbox">Inbox <span class="badge" id="nInbox">0</span></button>
+    <button class="tab" role="tab" data-view="board">Board <span class="badge" id="nBoard">0</span></button>
+    <button class="tab" role="tab" data-view="done">Done</button>
+    <button class="tab" role="tab" data-view="history">History</button>
+  </nav>
+  <div class="chips" id="chips"></div>
+</div></header>
+
+<main id="main" class="gut"><p class="status-msg">Loading your worklog…</p></main>
+
+<div class="capture gut"><div class="cap-in">
+  <textarea id="cap" rows="1" placeholder="Capture a thought. First line becomes the title.  (N)" aria-label="New item"></textarea>
+  <button id="capBtn" disabled>Add</button>
+</div></div>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="sheet side" id="side" hidden aria-label="Step details"></aside>
+<aside class="sheet" id="sheet" hidden aria-label="Item details"></aside>
+<div class="toast" id="toast" hidden></div>
+<div class="np" id="np" hidden role="dialog" aria-label="New project"></div>
+
+<script src="worklog.js"></script>
+
+</body></html>
