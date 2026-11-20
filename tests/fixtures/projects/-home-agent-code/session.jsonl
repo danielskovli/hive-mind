@@ -1,0 +1,12 @@
+{"type":"user","isMeta":true,"isSidechain":false,"cwd":"/home/agent/code","sessionId":"s-1","gitBranch":"main","timestamp":"2026-09-22T10:00:00Z","message":{"role":"user","content":"<local-command-caveat>META-CAVEAT</local-command-caveat>"}}
+{"type":"user","isSidechain":false,"cwd":"/home/agent/code","sessionId":"s-1","gitBranch":"main","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"<command-name>/model</command-name>COMMAND-WRAPPER"}}
+{"type":"user","isSidechain":false,"cwd":"/home/agent/code","sessionId":"s-1","gitBranch":"main","timestamp":"2026-09-22T10:00:02Z","message":{"role":"user","content":"Implement issue 12345 please."}}
+{"type":"assistant","isSidechain":false,"sessionId":"s-1","timestamp":"2026-09-22T10:01:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}
+{"type":"user","isSidechain":false,"sessionId":"s-1","timestamp":"2026-09-22T10:01:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"TOOL-OUTPUT"}]}}
+{"type":"assistant","isSidechain":false,"sessionId":"s-1","timestamp":"2026-09-22T10:02:00Z","message":{"role":"assistant","content":[{"type":"text","text":"I added a null-forgiving operator to silence the warning."}]}}
+{"type":"assistant","isSidechain":true,"sessionId":"s-1","timestamp":"2026-09-22T10:02:30Z","message":{"role":"assistant","content":[{"type":"text","text":"SIDECHAIN-TEXT"}]}}
+{"type":"user","isSidechain":false,"sessionId":"s-1","timestamp":"2026-09-22T10:03:00Z","message":{"role":"user","content":[{"type":"text","text":"No, we don't want ! operators anywhere. Widen the type instead."}]}}
+{"type":"user","isSidechain":false,"sessionId":"s-1","timestamp":"2026-09-22T10:03:01Z","message":{"role":"user","content":"<system-reminder>REMINDER</system-reminder>"}}
+{"type":"user","isCompactSummary":true,"isSidechain":false,"sessionId":"s-1","timestamp":"2026-09-22T10:04:00Z","message":{"role":"user","content":"COMPACT-SUMMARY This session is being continued"}}
+{"type":"user","isSidechain":false,"sessionId":"s-1","timestamp":"2026-09-22T10:05:00Z","message":{"role":"user","content":"LAST-HUMAN-TURN keep going"}}
+{"type":"assistant","truncat
