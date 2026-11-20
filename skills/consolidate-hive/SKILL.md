@@ -30,24 +30,25 @@ Knowledge moves in one direction, upward, and each layer is cheaper to trust tha
 ## Where things are
 
 - The hive checkout: the prompt names it; otherwise
-  `hive=$(cd "$(readlink ~/.claude/rules/hive)/.." && pwd)`. Memory is `$hive/memory/`.
+  `hive=$(cd "$(readlink ~/.claude/rules/hive)/.." && pwd)`. Memory is `$hive/memory/`. The core,
+  with `bin/hive` and this skill, is `$hive/hive-mind`; `hive` on the PATH runs it.
 - Transcripts: `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/*.jsonl` on this machine. Skip the hive
   checkout's own project directory: those are tidy and harvest sessions.
 - The last tidy and retro: the newest `decisions/tidy/*.md` and `decisions/*-retro.md`.
-- Which memories sessions open: `$hive/bin/hive usage [days]` (30 by default) counts, per memory,
+- Which memories sessions open: `hive usage [days]` (30 by default) counts, per memory,
   the sessions on every machine that read it, from each machine's records in `memory/.usage/` (this
   machine's brought up to date first). A memory whose index line carries the whole fact can earn its
   place without ever being opened.
-- What rules cost: `$hive/bin/hive costs [days]` lists, per rule, what sessions on every machine
+- What rules cost: `hive costs [days]` lists, per rule, what sessions on every machine
   logged with `hive cost` (`memory/.costs/`): where following it cost something, a conflict, or why
   a default did not fit.
 - The budget: `MEMORY.md` within 170 lines and 22,000 bytes, every index line within 180
-  characters. A tidy becomes due at 90% of it. `bin/hive index` enforces it by leaving memories out, which is the failure this skill
+  characters. A tidy becomes due at 90% of it. `hive index` enforces it by leaving memories out, which is the failure this skill
   prevents: past the budget, its last line says how many are missing.
 
 Edit `memory/`, `decisions/` and `worklog/` in place; the hooks commit and push them. Never edit
 `instructions/`, `skills/` or anything else in the checkout (a hook refuses it): changes there are
-pull requests from a worktree, and only the retro opens them. Run `$hive/bin/hive index` after
+pull requests from a worktree, and only the retro opens them. Run `hive index` after
 renaming, retiring or deleting memories.
 
 ## Retiring a memory
@@ -77,7 +78,7 @@ questions: anything that needs the user goes into the log under "For the retro".
    by `hive usage`, unless the index line alone does the work, and those most specific to one
    finished task), and list each under "For the retro".
 4. **Firmness.** Give each feedback memory without `firmness` one, judged from its text as
-   `instructions/hive.md` says ("Rule or default"): `rule` only where it quotes the user stating or
+   the core's `instructions/hive.md` says ("Rule or default"): `rule` only where it quotes the user stating or
    confirming a rule; in doubt, `default`.
 5. **Harvest.** Harvest this machine's transcripts since the time the prompt gives (see harvest mode).
 6. **Claude Code drift.** Claude Code changes how it writes memory without notice; you are the one
@@ -89,8 +90,8 @@ questions: anything that needs the user goes into the log under "For the retro".
      or two what changed since the newest earlier quote in `decisions/tidy/` ("unchanged", or what).
    - Read the memory files added or changed since that quote (`git log`) for frontmatter keys, file
      names or places the hive does not expect.
-   - Judge each change against how the hive uses memory: `instructions/hive.md` ("Memory"), the
-     index budget, and the sync's merge (`combine` in `bin/hive`). A harmless change gets its line.
+   - Judge each change against how the hive uses memory: the core's `instructions/hive.md` ("Memory"), the
+     index budget, and the sync's merge (`combine` in the core's `bin/hive`). A harmless change gets its line.
      For one that costs something, fix what you can in `memory/`, and add a bullet that starts
      `- Drift: ` saying what changed, what it costs and what would fix it: the next interactive
      session puts the log in the Worklog inbox, or tells the user.
@@ -111,7 +112,7 @@ questions: anything that needs the user goes into the log under "For the retro".
    the tidy ran, what you merged, retired, deleted and shortened, and the rules you marked, each with
    its reason in a line;
    memories harvested, each with its session; the drift section; the candidates; and "For the retro".
-   Then `$hive/bin/hive index`.
+   Then `hive index`.
 
 ## Harvest mode (automatic, unattended)
 
@@ -169,7 +170,7 @@ before the next batch, and say in a line what changed.
 5. **Decisions.** Each decision record since then: does a memory, an instruction or a skill act on
    it? One that nothing reflects is a gap to close now. One a newer decision contradicts without
    saying so is a question for the user.
-6. **The Worklog.** Refresh the backup in `worklog/` as its README says (this session has the Worklog
+6. **The Worklog,** where the hive has one. Refresh the backup in `worklog/` as the worklog-setup skill says (this session has the Worklog
    tools; automatic sessions do not). Look for patterns worth a memory or an instruction: work that
    keeps getting blocked on the same thing, tasks that never move.
 7. **Health.** The index against its budget, files with two versions left, how old the backup is,

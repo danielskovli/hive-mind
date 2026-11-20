@@ -1,16 +1,17 @@
 #!/bin/sh
-# Keeps this machine's Claude Code in step with the hive checkout this script lives in.
+# Keeps this machine's Claude Code in step with the hive this script's checkout sits in.
 #
-#   hive install [--force]     wire Claude Code to this checkout (settings, rules, skills, index),
+#   hive install [--force]     wire Claude Code to this hive (settings, rules, skills, index, sources),
 #                               and put `hive` on the PATH through ~/.local/bin
-#   hive uninstall             undo install; the checkout and its memory stay
-#   hive sync [--hook]         commit local memory, merge with origin, push, relink, rebuild index,
-#                               and run `settings`
+#   hive uninstall             undo install; the hive and its memory stay
+#   hive sync [--hook]         commit local memory, merge with origin, push, move the sources to their
+#                               pins, relink, rebuild the index, and run `settings`
+#   hive upgrade [source]      pin every source (or one) to its repository's newest commit, and push
 #   hive settings              bring the hive's keys in Claude Code's settings up to what this
-#                               checkout installs, where install has run; never in a sandbox
+#                               core installs, where install has run; never in a sandbox
 #   hive save [--background]   commit memory/, decisions/ and worklog/ and push them
 #   hive index                 rebuild memory/MEMORY.md from the memory files' frontmatter
-#   hive guard                 PreToolUse hook: refuse edits to the checkout outside memory/,
+#   hive guard                 PreToolUse hook: refuse edits to the hive outside memory/,
 #                               decisions/ and worklog/
 #   hive tidy [--auto]         run the consolidate-hive skill's tidy now, in a headless Claude
 #                               session; --auto (from the session-start hook) only when it is due
@@ -20,17 +21,24 @@
 #   hive cost <rule> <text>    log for the retro what following a rule cost, or why a default did
 #                               not fit; <rule> is a memory's name, instructions/<file> or skills/<name>
 #   hive costs [days]          what was logged in the last 30 (or [days]) days, on every machine
-#   hive status                this checkout against origin, the install, and the last error
+#   hive status                this hive against origin, its sources, the install, and the last error
 #   hive keepalive stop|prompt|end
 #                               hooks that keep an idle session's prompt cache warm (see keep-alive)
+#
+# A hive is a git checkout (conventionally ~/hive) holding one person's instructions, skills, memory,
+# decisions and Worklog backup, and a file, hive.lock, that pins the repositories it runs: this core
+# first, then any others, such as a collection of skills. Each is a plain clone in the hive, named as
+# in the lock and kept out of the hive's history, so this script sits at <hive>/<core>/bin/hive and the
+# folder above its checkout is the hive. A machine always runs the sources its hive commit names: sync
+# fetches every pinned commit before it moves the hive, and moves the sources after it, or nothing.
 #
 # `install` adds hooks to Claude Code's user settings: SessionStart runs `sync --hook`, Stop and
 # SessionEnd run `save --background`, PreToolUse runs `guard`, and Stop, UserPromptSubmit and
 # SessionEnd run `keepalive`. SessionStart output lands in the session's context, so in hook mode sync
 # prints nothing unless the session needs to know something.
 #
-# Only memory/, decisions/ and worklog/ (a backup of the Worklog artifact) are ever committed here.
-# Everything else changes by pull request.
+# Only memory/, decisions/ and worklog/ (a backup of the Worklog artifact) are ever committed here, and
+# hive.lock by `upgrade`. Everything else changes by pull request.
 #
 # Many sessions write at once, on one machine and on many. None of them ever waits on another or loses
 # a write: commits are local and serialised per checkout; local commits are rebased onto origin in a
@@ -51,12 +59,16 @@ while [ -L "$script" ]; do
         *) script=$(dirname "$script")/$target ;;
     esac
 done
-hive=$(cd "$(dirname "$script")/.." && pwd -P)
-self="$hive/bin/hive"
+core=$(cd "$(dirname "$script")/.." && pwd -P)
+hive=$(dirname "$core")
+self="$core/bin/hive"
 cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 branch=main
-start_marker='<!-- hive:workflow:start -->'
-end_marker='<!-- hive:workflow:end -->'
+lockpins="$hive/hive.lock"
+
+say() { printf 'hive: %s\n' "$*"; }
+die() { say "$*" >&2; exit 1; }
+[ -f "$lockpins" ] || die "$core is not inside a hive: there is no hive.lock in $hive"
 
 # Every git call runs insulated from the user's own git setup: paths unquoted (names may be non-ASCII),
 # no signing prompt on each turn, no user hooks. A machine with no identity gets a neutral one.
@@ -71,9 +83,6 @@ gnet() {
     GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
         gitc -C "$hive" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 "$@"
 }
-say() { printf 'hive: %s\n' "$*"; }
-die() { say "$*" >&2; exit 1; }
-
 g rev-parse --git-dir >/dev/null 2>&1 || die "$hive is not a git checkout"
 state="$(g rev-parse --absolute-git-dir)/hive"
 mkdir -p "$state"
@@ -389,7 +398,7 @@ EOF
 cmd_cost() {
     [ $# -eq 2 ] || die 'usage: hive cost <rule> "<context>: <what it cost>"'
     rule=$(cost_rule "$1") ||
-        die "not a rule in the hive: $1 (give a memory's name, instructions/<file>.md or skills/<name>)"
+        die "not a rule in this hive: $1 (give a memory's name, instructions/<file>.md or skills/<name>)"
     text=$(printf '%s' "$2" | tr '\t\r\n' '   ' | sed 's/^ *//; s/ *$//')
     [ -n "$text" ] || die "say in what context the rule cost something, and what"
     file="$hive/memory/.costs/$(machine_file).tsv"
@@ -403,8 +412,8 @@ cmd_cost() {
 cost_rule() {
     case "$1" in ''|*[!A-Za-z0-9._/-]*|*..*|/*) return 1 ;; esac
     case "$1" in
-        instructions/*) r=${1%.md}.md; [ -f "$hive/$r" ] ;;
-        skills/*) r=${1%/}; r=${r%/SKILL.md}; [ -f "$hive/$r/SKILL.md" ] ;;
+        instructions/*) r=${1%.md}.md; [ -f "$hive/$r" ] || [ -f "$core/$r" ] ;;
+        skills/*) r=${1%/}; r=${r%/SKILL.md}; [ -f "$hive/$r/SKILL.md" ] || ls "$hive"/*/"$r"/SKILL.md >/dev/null 2>&1 ;;
         */*) return 1 ;;
         *)
             r=${1%.md}
@@ -458,6 +467,95 @@ for rule in sorted(entries, key=lambda r: (-len(entries[r]), r)):
 EOF
 }
 
+# --- sources ----------------------------------------------------------------------------------------
+
+# Prints the sources a commit's hive.lock pins, "<name> <url> <commit>" a line, in the lock's order:
+# HEAD, any commit, or - for the working tree's. A line that is not that shape, or names a folder the
+# hive itself uses, is left out (`hive status` lists it), so a hand-edited lock cannot reach outside the
+# hive or over its content.
+pins() {
+    if [ "${1:--}" = - ]; then cat "$lockpins" 2>/dev/null; else g show "$1:hive.lock" 2>/dev/null; fi | pin_lines valid
+}
+# pin_lines valid|invalid: the lock's lines that are (or are not) a source, comments and blanks aside.
+pin_lines() {
+    awk -v want="$1" '
+        /^[[:space:]]*(#|$)/ { next }
+        { ok = NF == 3 && $1 ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ && $3 ~ /^[0-9a-f]+$/ && (length($3) == 40 || length($3) == 64) \
+               && $1 !~ /^(memory|decisions|worklog|instructions|skills|sandbox|bin|tests|template)$/ }
+        want == "valid" && ok { print $1, $2, $3 }
+        want == "invalid" && !ok { print }'
+}
+short() { printf '%.7s' "$1"; }
+
+# Keeps a source's clone out of the hive's history, beside the hive's own .gitignore.
+exclude_source() {
+    f=$(g rev-parse --git-path info/exclude)
+    case "$f" in /*) ;; *) f="$hive/$f" ;; esac
+    mkdir -p "$(dirname "$f")"
+    grep -qxF "/$1/" "$f" 2>/dev/null || printf '/%s/\n' "$1" >>"$f"
+}
+
+# Makes sure every commit <commit>'s lock pins is on this machine: a missing source is cloned, and a
+# clone that lacks its pinned commit fetches it. Moves no checkout, so it can run before the hive moves.
+# Fails at the first source it cannot get, naming it.
+sources_fetch() {
+    list=$(pins "$1")
+    while read -r name url sha; do
+        [ -n "$name" ] || continue
+        dir="$hive/$name"
+        if [ ! -e "$dir/.git" ]; then
+            # Claude Code may have made an empty folder by that name; anything else there is someone's.
+            rmdir "$dir" 2>/dev/null || true
+            if [ -e "$dir" ]; then
+                fail_with "source $name: $dir exists and is not a clone; move it aside"
+                return 1
+            fi
+            if ! gnet clone -q --no-checkout "$url" "$dir" </dev/null 2>"$state/err"; then
+                rm -rf "$dir"
+                fail_with "source $name: could not clone $url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+                return 1
+            fi
+            exclude_source "$name"
+        fi
+        gitc -C "$dir" cat-file -e "$sha^{commit}" 2>/dev/null && continue
+        # A pinned commit by name, which GitHub serves; else everything, for a server that does not.
+        gnet -C "$dir" fetch -q origin "$sha" </dev/null 2>"$state/err" || gnet -C "$dir" fetch -q origin </dev/null 2>>"$state/err" || true
+        if ! gitc -C "$dir" cat-file -e "$sha^{commit}" 2>/dev/null; then
+            fail_with "source $name: could not fetch its pinned commit $(short "$sha") from $url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+            return 1
+        fi
+    done <<EOF
+$list
+EOF
+}
+
+# Checks every source out at the commit <commit>'s lock pins, from what is on this machine. The core
+# goes last: it holds this script, and a checkout replaces each file whole, so the run in progress reads
+# on from the old one, while every command started after it runs the new one.
+sources_checkout() {
+    list=$(pins "$1" | awk -v c="${core##*/}" '$1 == c { last = $0; next } { print } END { if (last != "") print last }')
+    stuck=""
+    while read -r name url sha; do
+        [ -n "$name" ] || continue
+        dir="$hive/$name"
+        # Detached at the pin is done; a fresh clone is on a branch with nothing checked out yet.
+        if ! gitc -C "$dir" symbolic-ref -q HEAD >/dev/null 2>&1 \
+            && [ "$(gitc -C "$dir" rev-parse -q --verify HEAD 2>/dev/null)" = "$sha" ]; then
+            continue
+        fi
+        if ! gitc -C "$dir" checkout -q --detach "$sha" </dev/null 2>"$state/err"; then
+            stuck="$stuck $name"
+            logline "source $name stays at $(gitc -C "$dir" rev-parse --short HEAD 2>/dev/null): $(tail -n 1 "$state/err")"
+        fi
+    done <<EOF
+$list
+EOF
+    if [ -n "$stuck" ]; then
+        fail_with "source(s)$stuck could not move to their pins in hive.lock (see $log); a source is never edited in place: undo the change there"
+        return 1
+    fi
+}
+
 # --- commit and exchange ----------------------------------------------------------------------------
 
 where() {
@@ -469,12 +567,18 @@ where() {
 # being edited in the same checkout stays out of the commit, staged or not.
 commit_local() {
     [ -n "$(g status --porcelain -- memory decisions worklog)" ] || return 0
+    # Only the folders this hive has, on disk or in the index: git refuses a path that matches nothing,
+    # and a new hive may have no worklog/ yet.
+    ours=$(for d in memory decisions worklog; do
+        if [ -e "$hive/$d" ] || [ -n "$(g ls-files -- "$d" | head -n 1)" ]; then echo "$d"; fi
+    done)
     # An index lock this old is a crashed git's, and would fail every commit from now on.
     if [ -n "$(find "$(g rev-parse --absolute-git-dir)/index.lock" -mmin +10 2>/dev/null)" ]; then
         rm -f "$(g rev-parse --absolute-git-dir)/index.lock"
         logline "removed an index.lock older than ten minutes"
     fi
-    g add -A -- memory decisions worklog
+    # shellcheck disable=SC2086 # folder names without spaces, one per word
+    g add -A -- $ours
     screen_secrets
     screen_case
     guard_worklog_shrink
@@ -490,7 +594,7 @@ commit_local() {
     [ "${#subject}" -le 100 ] || subject="$(printf '%s' "$subject" | cut -c1-96) …"
     g commit -q --no-verify -m "$subject" \
         -m "Hive-Host: $(where)
-Hive-Session: ${CLAUDE_CODE_SESSION_ID:-none}" -- memory decisions worklog
+Hive-Session: ${CLAUDE_CODE_SESSION_ID:-none}" -- $ours
 }
 
 # What reaches GitHub within the turn must not hold a secret. A staged file whose added lines match a
@@ -553,7 +657,7 @@ exchange() {
         pushed=$(cat "$state/pushed" 2>/dev/null || true)
         if [ -n "$pushed" ] && ! g merge-base --is-ancestor "$pushed" "$here" 2>/dev/null; then pushed=""; fi
         # What other machines added that this checkout does not have on disk, for the hook's report.
-        g diff --name-status "$base" "$there" -- memory instructions skills >>"$incoming" 2>/dev/null || true
+        g diff --name-status "$base" "$there" -- memory instructions skills hive.lock >>"$incoming" 2>/dev/null || true
         if [ "$here" = "$there" ] || [ "$here" = "$base" ] || [ "$here" = "$pushed" ]; then
             target=$there
         elif [ -n "$pushed" ]; then
@@ -574,7 +678,13 @@ exchange() {
         [ "$hook" = 1 ] || sleep "$attempt"
     done
     rm -f "$state/error"
-    move_live "$target" "$here"
+    # The sources the result pins must all be here before the hive moves to it: both move, or neither.
+    if ! sources_fetch "$target"; then
+        [ "$here" = "$target" ] || printf '%s\n' "$here" >"$state/pushed"
+        return 1
+    fi
+    move_live "$target" "$here" || return 1
+    sources_checkout HEAD
 }
 
 # Prepares the private worktree at <commit>. Only this script uses it, and only while holding the lock,
@@ -618,10 +728,10 @@ rebase_privately() {
         w diff --name-only --diff-filter=U >"$state/unmerged"
         while IFS= read -r p; do
             case "$p" in
-                memory/*|decisions/*|worklog/*) resolve "$p" ;;
+                memory/*|decisions/*|worklog/*|hive.lock) resolve "$p" ;;
                 *)
                     w rebase --abort >/dev/null 2>&1
-                    fail_with "conflict in $p, outside memory/, decisions/ and worklog/; nothing pushed"
+                    fail_with "conflict in $p, outside memory/, decisions/, worklog/ and hive.lock; nothing pushed"
                     return 1 ;;
             esac
         done <"$state/unmerged"
@@ -664,9 +774,23 @@ move_live() {
 # Resolves one conflicted path in the private worktree from the index stages (1 base, 2 upstream,
 # 3 the local commit being replayed). Both sides present: combine them. One side deleted: keep the
 # side that still has the file, so an edit beats a delete. worklog/ is a copy of the Worklog, not
-# knowledge, and its JSON must stay whole: the replayed snapshot wins.
+# knowledge, and its JSON must stay whole: the replayed snapshot wins. hive.lock merges per source.
 resolve() {
     case "$1" in
+        hive.lock)
+            # Per source: the replayed commit's pin where it moved one, else upstream's. Two machines
+            # upgrading different sources both land; of two upgrades of one source, the replayed wins.
+            d=$(mktemp -d)
+            w show ":1:$1" >"$d/base" 2>/dev/null || : >"$d/base"
+            w show ":2:$1" >"$d/ours" 2>/dev/null || : >"$d/ours"
+            w show ":3:$1" >"$d/theirs" 2>/dev/null || : >"$d/theirs"
+            awk 'FILENAME == ARGV[1] { if (NF == 3) b[$1] = $3; next }
+                 FILENAME == ARGV[2] { if (NF == 3 && $1 !~ /^#/ && b[$1] != $3) { t[$1] = $0; o[++n] = $1 }; next }
+                 { if (NF == 3 && ($1 in t)) { print t[$1]; delete t[$1] } else print }
+                 END { for (i = 1; i <= n; i++) if (o[i] in t) print t[o[i]] }' "$d/base" "$d/theirs" "$d/ours" >"$wt/$1"
+            w add -- "$1"
+            rm -rf "$d"
+            return 0 ;;
         worklog/*)
             if w show ":3:$1" >"$wt/$1" 2>/dev/null || w show ":2:$1" >"$wt/$1" 2>/dev/null; then w add -- "$1"
             else w rm -q --cached --ignore-unmatch -- "$1" >/dev/null; rm -f "$wt/$1"; fi
@@ -766,6 +890,14 @@ link() {
     if [ ! -L "$path" ] && [ -d "$path" ] && [ "$(cd "$path" && pwd -P)" = "$target" ]; then
         return 0
     fi
+    # A folder that is itself a link into the hive (~/.claude/skills to the hive's skills/) would take
+    # another layer's link into the hive's own files.
+    parent=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P || true)
+    case "$parent/" in
+        "$hive"/*)
+            if [ "$mode" = check ]; then conflicts=$((conflicts + 1)); else conflict "$path: $(dirname "$path") is inside the hive ($parent), so a link there would land in the hive"; fi
+            return 0 ;;
+    esac
     # In an agentctl sandbox a real skill directory is the agent's own, from its definition, and wins
     # over the hive's of the same name. agentd rewrites it on every pass, and would write through a
     # link into the checkout, so it is never taken over, even with --force.
@@ -786,8 +918,12 @@ link() {
         case "$current" in
             "$hive"/*) rm "$path" ;;
             *)
-                # Another checkout's link, say after the hive was cloned somewhere new.
-                if [ "$force" = 1 ]; then
+                # A link to nothing (its checkout moved or gone) is nobody's. Another checkout's link,
+                # say after the hive was cloned somewhere new, moves aside only with --force.
+                if [ ! -e "$path" ]; then
+                    rm "$path"
+                    [ "$mode" = report ] && say "replaced the dangling link $path ($current)"
+                elif [ "$force" = 1 ]; then
                     mv "$path" "$(backup_dir)/"
                     [ "$mode" = report ] && say "moved the link $path ($current) to $(backup_dir)/"
                 else
@@ -818,16 +954,35 @@ conflict() {
     return 0
 }
 
-# Links instructions/ as a user rules directory and every skill; drops links whose target is gone.
+# The skill layers, highest first: the hive's own skills, then the sources from the last in hive.lock
+# to the first, which is the core (and the core last in any case).
+layers() {
+    {
+        echo "$hive"
+        pins HEAD | awk -v h="$hive" '{ l[NR] = h "/" $1 } END { for (i = NR; i >= 1; i--) print l[i] }'
+        echo "$core"
+    } | awk '!seen[$0]++'
+}
+
+# Links the core's instructions and the hive's as two user rules directories, and every skill of every
+# layer, a name the highest layer that has it; drops links into the hive whose target is gone.
 link_all() {
     mode=$1
-    conflicts=0 agent_skills=
+    conflicts=0 agent_skills= claimed=" "
+    link "$core/instructions" "$cfg/rules/hive-mind"
     link "$hive/instructions" "$cfg/rules/hive"
-    for d in "$hive"/skills/*/; do
-        [ -f "$d/SKILL.md" ] || continue
-        s=$(basename "$d")
-        link "$hive/skills/$s" "$cfg/skills/$s"
-    done
+    list=$(layers)
+    while IFS= read -r layer; do
+        for d in "$layer"/skills/*/; do
+            [ -f "$d/SKILL.md" ] || continue
+            s=$(basename "$d")
+            case "$claimed" in *" $s "*) continue ;; esac
+            claimed="$claimed$s "
+            link "$layer/skills/$s" "$cfg/skills/$s"
+        done
+    done <<EOF
+$list
+EOF
     [ "$mode" = check ] && return 0
     for l in "$cfg"/skills/* "$cfg"/rules/*; do
         [ -L "$l" ] || continue
@@ -878,10 +1033,11 @@ except ValueError as e:
 before = json.loads(json.dumps(s))
 
 def mine(group):
-    # This checkout's hooks, and any other checkout's: a hive cloned somewhere new replaces them.
+    # This checkout's hooks, and any other checkout's: a hive cloned somewhere new replaces them, and so
+    # does one taking over from its predecessor, agent-brain's bin/brain.
     for h in group.get("hooks", []):
         c = h.get("command", "")
-        if c.startswith(quoted + " ") or ("bin/hive" in c and c.endswith((" sync --hook", " save --background", " guard",
+        if c.startswith(quoted + " ") or (("bin/hive" in c or "bin/brain" in c) and c.endswith((" sync --hook", " save --background", " guard",
                                                                           " keepalive stop", " keepalive prompt", " keepalive end"))):
             return True
     return False
@@ -976,45 +1132,6 @@ cmd_settings() {
     [ -z "$changed" ] || say "updated $cfg/settings.json to what this checkout installs ($changed); sessions started from now on use it"
 }
 
-# --- migration from the copy-based install ----------------------------------------------------------
-
-# The first version of this repository copied workflow.md into a marked block of CLAUDE.md, copied the
-# skills into ~/.claude/skills, and kept a checksum of each copy in .hive/. A copy that still
-# matches its checksum was never edited, so it goes, the renamed consolidate-memory included; an
-# edited one stays and is reported by link_all. The block would duplicate what the rules link loads.
-old_sum() { (cd "$1" && find . -type f ! -name .DS_Store -exec cksum {} + | LC_ALL=C sort -k3 | cksum); }
-migrate() {
-    records="$cfg/.hive"
-    if [ -d "$records" ]; then
-        for rec in "$records"/skill-*; do
-            [ -f "$rec" ] || continue
-            name=${rec##*/skill-}
-            copy="$cfg/skills/$name"
-            if [ -d "$copy" ] && [ ! -L "$copy" ] && [ "$(old_sum "$copy")" = "$(cat "$rec")" ]; then
-                mv "$copy" "$(backup_dir)/"
-                say "moved the old, unedited copy of skill $name to $(backup_dir)/"
-            fi
-        done
-        mv "$records" "$(backup_dir)/install-records"
-        say "moved the old install records to $(backup_dir)/install-records"
-    fi
-    md="$cfg/CLAUDE.md"
-    if [ -f "$md" ] && grep -qxF "$start_marker" "$md"; then
-        if ! grep -qxF "$end_marker" "$md"; then
-            say "skipped: $md has the old workflow block's start marker but not its end; remove the block by hand"
-            return 0
-        fi
-        awk -v s="$start_marker" -v e="$end_marker" '$0 == s { f = 1 } f { print } $0 == e { f = 0 }' "$md" \
-            >"$(backup_dir)/CLAUDE.md-workflow-block"
-        tmp=$(mktemp "$state/CLAUDE.md.XXXXXX")
-        awk -v s="$start_marker" -v e="$end_marker" '$0 == s { skip = 1 } !skip { print } $0 == e { skip = 0 }' "$md" >"$tmp"
-        # cat, not mv: CLAUDE.md may be a link, and its mode stays.
-        cat "$tmp" >"$md"
-        rm -f "$tmp"
-        say "removed the old workflow block from $md (saved in $(backup_dir)/)"
-    fi
-}
-
 # --- commands ---------------------------------------------------------------------------------------
 
 cmd_install() {
@@ -1023,7 +1140,7 @@ cmd_install() {
     # Installs run concurrently (a pre-launch step per session launch) and race hook syncs over the
     # same links and settings: one at a time.
     lock 30 || die "another hive command held the lock for 30 seconds; try again"
-    migrate
+    if sources_fetch HEAD && sources_checkout HEAD; then :; else say "$(cat "$state/error")"; fi
     link_all report
     settings install
     say "settings: autoMemoryDirectory is $hive/memory; SessionStart, UserPromptSubmit, PreToolUse, Stop and SessionEnd hooks run $self"
@@ -1050,7 +1167,7 @@ link_command() {
     else
         mkdir -p "$(dirname "$command_link")"
         ln -s "$self" "$command_link"
-        say "linked $command_link, so \`hive\` runs this checkout's bin/hive"
+        say "linked $command_link, so \`hive\` runs this hive's $self"
     fi
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) ;;
@@ -1130,7 +1247,7 @@ cmd_sync() {
 # alone are past that.
 report_cold() {
     say "this session started before the hive was linked on this machine, so it has not loaded the hive's instructions or memory index. Before anything else, read each of these files in full and follow them as if they were part of your instructions; later sessions load them on their own:"
-    for f in "$hive"/instructions/*.md; do
+    for f in "$core"/instructions/*.md "$hive"/instructions/*.md; do
         [ -f "$f" ] && echo "- $f"
     done
     # Printed before the sync rebuilds it, so it may not exist yet; it will by the time it is read.
@@ -1157,6 +1274,7 @@ report_incoming() {
                     else entries "$hive/$path" | cut -f2-; fi ;;
                 instructions/*) echo "- instructions changed: $hive/$path (re-read it before relying on your copy)" ;;
                 skills/*) echo "- skill changed: ${path#skills/} (takes effect in the next session)" ;;
+                hive.lock) echo "- the sources moved to new pins (hive.lock): re-read $core/instructions/ before relying on your copy; their skills take effect in the next session" ;;
             esac
         done
         [ "$n" -le 15 ] || echo "- … and $((n - 15)) more: git -C $hive log --stat"
@@ -1536,7 +1654,7 @@ report_drift() {
     [ -n "$f" ] || return 0
     f=${f#"$hive"/}
     [ "$(cat "$hive/decisions/tidy/drift-reported" 2>/dev/null)" = "$f" ] && return 0
-    say "the tidy logged in $f found Claude Code changing how memory works (its \"- Drift:\" lines). Put it in the Worklog inbox as one item linking that log, unless the Worklog has one for it already, in any status."
+    say "the tidy logged in $f found Claude Code changing how memory works (its \"- Drift:\" lines). Put it in the Worklog inbox as one item linking that log, unless the Worklog has one for it already, in any status; in a hive without a Worklog, tell the user."
     printf '%s\n' "$f" >"$hive/decisions/tidy/drift-reported"
 }
 
@@ -1579,7 +1697,7 @@ claim_tidy() {
 # `hive usage`.
 spawn_tidy() {
     prompt="Run the consolidate-hive skill in $1 mode, unattended. The hive checkout is $hive. $2"
-    turns="$hive/skills/consolidate-hive/scripts/recent-turns.sh"
+    turns="$core/skills/consolidate-hive/scripts/recent-turns.sh"
     linked_turns="$cfg/skills/consolidate-hive/scripts/recent-turns.sh"
     (
         cd "$hive" || exit 0
@@ -1617,10 +1735,11 @@ cmd_tidy() {
     fi
 }
 
-# PreToolUse hook for Edit, Write and their kin: the checkout every session loads changes only in
-# memory/, decisions/ and worklog/; instructions, skills and the rest go through a pull request. A
-# file under ~/.claude/rules/hive or ~/.claude/skills is the checkout too. Anything unexpected
-# allows the call: a guard must never break editing elsewhere.
+# PreToolUse hook for Edit, Write and their kin: the hive every session loads changes only in memory/,
+# decisions/ and worklog/; instructions, skills and the rest go through a pull request, hive.lock through
+# `hive upgrade`, and a source (the core among them) through a pull request in its own repository. A
+# file under ~/.claude/rules/hive* or ~/.claude/skills is the hive too. Anything unexpected allows the
+# call: a guard must never break editing elsewhere.
 cmd_guard() {
     python3 -I -c '
 import json, os, sys
@@ -1637,15 +1756,67 @@ except Exception:
 if real != hive and not real.startswith(hive + os.sep):
     sys.exit(0)
 rel = os.path.relpath(real, hive)
-if rel.split(os.sep)[0] in ("memory", "decisions", "worklog"):
+top = rel.split(os.sep)[0]
+if top in ("memory", "decisions", "worklog"):
     sys.exit(0)
-reason = ("%s is the hive checkout every session loads (%s). Only memory/, decisions/ and worklog/ "
-          "change there; instructions, skills and the rest change by pull request from a worktree: "
-          "git -C %s worktree add %s-<topic> -b <topic> origin/main" % (path, rel, hive, hive))
+if top == "hive.lock":
+    reason = ("%s pins the sources this hive runs, and changes only through `hive upgrade [source]`, "
+              "which moves a pin to its repository\x27s newest commit and pushes it." % path)
+elif os.path.isdir(os.path.join(hive, top, ".git")):
+    reason = ("%s is in %s, a source this hive runs: a clone, checked out at the commit hive.lock pins. "
+              "Change it by pull request in its own repository, from a clone elsewhere; `hive upgrade %s` "
+              "then pins the result." % (path, top, top))
+else:
+    reason = ("%s is the hive checkout every session loads (%s). Only memory/, decisions/ and worklog/ "
+              "change there; instructions, skills and the rest change by pull request from a worktree: "
+              "git -C %s worktree add %s-<topic> -b <topic> origin/main" % (path, rel, hive, hive))
 print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                          "permissionDecision": "deny",
                                          "permissionDecisionReason": reason}}))
 ' "$hive"
+}
+
+# Moves every source's pin (or one source's) to the newest commit of its repository's default branch,
+# commits hive.lock and pushes it the way memory is pushed, then moves this machine's sources there.
+cmd_upgrade() {
+    lock 30 || die "another hive command held the lock for 30 seconds; try again"
+    on_main || die "$(cat "$state/error")"
+    [ -z "$(g status --porcelain -- hive.lock)" ] || die "hive.lock has uncommitted changes; drop them (git -C $hive checkout -- hive.lock) and upgrade again"
+    pins HEAD >"$state/upgrade-pins"
+    if [ -n "${1:-}" ] && ! awk -v n="$1" '$1 == n { f = 1 } END { exit !f }' "$state/upgrade-pins"; then
+        die "hive.lock pins no source named $1"
+    fi
+    cp "$lockpins" "$state/lock.new"
+    moved=""
+    while read -r name url sha; do
+        [ -z "${1:-}" ] || [ "$name" = "$1" ] || continue
+        new=$(gnet ls-remote "$url" HEAD </dev/null 2>"$state/err" | awk 'NR == 1 { print $1 }')
+        [ -n "$new" ] || die "could not read $url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+        if [ "$new" = "$sha" ]; then
+            say "$name is at its repository's newest commit, $(short "$sha")"
+            continue
+        fi
+        awk -v n="$name" -v s="$new" '$1 == n && NF == 3 { $3 = s } { print }' "$state/lock.new" >"$state/lock.tmp"
+        mv "$state/lock.tmp" "$state/lock.new"
+        moved="$moved $name"
+        say "$name: $(short "$sha") to $(short "$new")"
+    done <"$state/upgrade-pins"
+    [ -n "$moved" ] || return 0
+    cat "$state/lock.new" >"$lockpins"
+    g add -- hive.lock
+    g commit -q --no-verify -m "hive.lock: upgrade$(printf '%s' "$moved" | sed 's/^ //; s/ /, /g; s/^/ /')" \
+        -m "Hive-Host: $(where)
+Hive-Session: ${CLAUDE_CODE_SESSION_ID:-none}" -- hive.lock
+    touch "$state/pending"
+    if ! run_pending; then
+        die "upgraded$moved in a local commit, but: $(cat "$state/error" 2>/dev/null). The next sync retries."
+    fi
+    link_all quiet
+    rebuild_index
+    unlock
+    if ! settings_out=$("$self" settings 2>&1); then say "could not update Claude Code's settings: ${settings_out#hive: }"
+    elif [ -n "$settings_out" ]; then printf '%s\n' "$settings_out"; fi
+    say "upgraded$moved and pushed; this machine runs the new pins, and other machines take them at their next sync"
 }
 
 cmd_usage() {
@@ -1655,7 +1826,10 @@ cmd_usage() {
 }
 
 cmd_status() {
-    echo "checkout   $hive ($(current_branch) at $(g rev-parse --short HEAD))"
+    echo "hive       $hive ($(current_branch) at $(g rev-parse --short HEAD))"
+    pins HEAD | while read -r name url sha; do
+        echo "source     $name at $(short "$sha"), from $url"
+    done
     if g rev-parse -q --verify "origin/$branch" >/dev/null; then
         g rev-list --left-right --count "HEAD...origin/$branch" |
             awk '{ print "origin     " $1 " commit(s) to push, " $2 " to pull, as of the last fetch" }'
@@ -1674,20 +1848,28 @@ cmd_status() {
 setup_checks() {
     # In a sandbox, agentd copies the agent's home over settings.json every 30 seconds (sandbox/README.md).
     if [ -n "${AGENT_NAME:-}" ]; then
-        missing="; if agentd puts them back, point this agent's home at the hive's sandbox/home (\"agentctl\")"
-        stale="; if agentd puts them back, sync the hive on the host, whose sandbox/home agentd copies (\"agentctl\")"
+        missing="; if agentd puts them back, point this agent's home at the core's sandbox/home (\"agentctl\")"
+        stale="; if agentd puts them back, sync the hive on the host, whose core's sandbox/home agentd copies (\"agentctl\")"
     else
-        missing=" (\"Your Mac\")" stale=" (\"Your Mac\")"
+        missing=" (\"A machine\")" stale=" (\"A machine\")"
     fi
+    pins HEAD | while read -r name url sha; do
+        at=$(gitc -C "$hive/$name" rev-parse -q --verify HEAD 2>/dev/null || true)
+        if [ "$at" = "$sha" ]; then line ok "source $name is at its pin, $(short "$sha")"
+        elif [ -z "$at" ]; then line fix "source $name is missing: run $self sync"
+        else line fix "source $name is at $(short "$at"), but hive.lock pins $(short "$sha"): run $self sync"; fi
+    done
+    bad=$(g show HEAD:hive.lock 2>/dev/null | pin_lines invalid | paste -sd'|' - | sed 's/|/ | /g')
+    [ -z "$bad" ] || line fix "hive.lock has lines that are not \"<name> <url> <commit>\" (or name a folder the hive uses), and are ignored: $bad"
     if ! installed; then line fix "Claude Code settings do not use the hive: run $self install$missing"
     elif ! command -v python3 >/dev/null || settings check; then line ok "Claude Code settings use the hive ($cfg/settings.json)"
     else line fix "Claude Code settings differ from what this checkout installs: run $self install$stale"; fi
     link_all check
     found=$(command -v hive 2>/dev/null || true)
     if [ -n "$found" ] && [ "$found" = "$command_link" ] && [ "$(readlink "$found")" = "$self" ]; then
-        line ok "\`hive\` runs this checkout ($found)"
+        line ok "\`hive\` runs this hive ($found)"
     else
-        line note "\`hive\` by name does not run this checkout; $self install links it (\"Your Mac\")"
+        line note "\`hive\` by name does not run this hive; $self install links it (\"A machine\")"
     fi
     shadowed=; [ -z "$agent_skills" ] || shadowed="; this agent's own in place of the hive's:$agent_skills"
     if [ "$conflicts" = 0 ]; then line ok "rules and skills are linked into $cfg$shadowed"
@@ -1705,7 +1887,7 @@ setup_checks() {
         else line ok "the Worklog backup is $days day(s) old"; fi
     fi
     old=$(find "$cfg/projects" -path '*/memory/*.md' ! -name MEMORY.md 2>/dev/null | wc -l | tr -d ' ')
-    [ "$old" = 0 ] || line note "$old old per-project memory file(s) no longer load: import them (\"Your Mac\", Then)"
+    [ "$old" = 0 ] || line note "$old old per-project memory file(s) no longer load: import them (\"A machine\", Then)"
     if [ -n "${AGENT_NAME:-}" ]; then
         if grep -q "^## The hive on this machine$" "$cfg/CLAUDE.md" 2>/dev/null; then
             line ok "this sandbox gets the hive's pointer from agentctl"
@@ -1721,7 +1903,7 @@ line() { printf '  %-4s  %s\n' "$1" "$2"; }
 duplicated_sections() {
     [ -f "$1" ] || return 0
     # Compared by text, not level: "### Gitea" in one is "## Gitea" in the other.
-    grep -h '^##* ' "$hive"/instructions/*.md 2>/dev/null | sed 's/^#* //' | sort -u >"$state/headings"
+    grep -h '^##* ' "$core"/instructions/*.md "$hive"/instructions/*.md 2>/dev/null | sed 's/^#* //' | sort -u >"$state/headings"
     grep '^##* ' "$1" | sed 's/^#* //' | sort -u | grep -Fxf "$state/headings" | paste -sd, - | sed 's/,/, /g'
     rm -f "$state/headings"
 }
@@ -1734,6 +1916,7 @@ case "$cmd" in
     install) cmd_install ;;
     uninstall) cmd_uninstall ;;
     sync) cmd_sync "$@" ;;
+    upgrade) cmd_upgrade "$@" ;;
     settings) cmd_settings ;;
     save) cmd_save "$@" ;;
     guard) cmd_guard ;;
@@ -1745,5 +1928,5 @@ case "$cmd" in
     costs) cmd_costs "$@" ;;
     status) cmd_status ;;
     keepalive) cmd_keepalive "$@" ;;
-    *) sed -n '2,25p' "$self" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 2 ;;
+    *) sed -n '2,26p' "$self" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 2 ;;
 esac
