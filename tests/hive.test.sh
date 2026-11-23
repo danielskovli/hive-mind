@@ -1391,6 +1391,16 @@ rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" &&
 out=$(pr 2>&1); rc=$?
 check "R7: a source that moved by hundreds of commits still gets a body GitHub accepts" "[ $rc = 0 ] && [ \"\$(wc -c <'$tmp/gh/body' | tr -d ' ')\" -le 65536 ]"
 
+# R6: a newer tidy that found nothing to upgrade (and closed the pull request) leaves an older,
+# untold upgrade line behind.
+printf '# Tidy, 2999-01-01\n\n## Upgrade\n\n- Upgrade: https://github.com/o/hive/pull/30 (extras)\n' >"$a/hive/decisions/tidy/2999-01-01.md"
+printf '# Tidy, 2999-01-02\n\n## Upgrade\n\nNothing to upgrade; the open pull request was closed.\n' >"$a/hive/decisions/tidy/2999-01-02.md"
+run a save >/dev/null 2>&1
+out=$(run b sync --hook 2>&1)
+check "R6: a session start does not announce an upgrade that a later tidy found nothing left of" "! printf '%s' \"\$out\" | grep -q 'pull/30'"
+rm -f "$a"/hive/decisions/tidy/2999-01-0[12].md "$b"/hive/decisions/tidy/2999-01-0[12].md
+run b save >/dev/null 2>&1; run a sync >/dev/null 2>&1; run b sync >/dev/null 2>&1
+
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
 machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
