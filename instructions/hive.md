@@ -111,3 +111,7 @@ the user's task, never before it, and gets reported in a line of plain words, no
   lines, then add one item to the Worklog inbox that sums them up and links the log, unless the Worklog
   has one for it already, in any status; in a hive without a Worklog, tell the user. A headless session
   lists it under "Captured for later" instead.
+- **An upgrade waits for review:** the tidy opened a pull request that moves the hive's sources to their
+  newest commits. Once the user's task is done, tell them in plain words which sources it moves and give
+  the link; merging it upgrades every machine at its next sync. Don't merge or review it yourself unless
+  they ask.

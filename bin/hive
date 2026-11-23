@@ -7,6 +7,7 @@
 #   hive sync [--hook]         commit local memory, merge with origin, push, move the sources to their
 #                               pins, relink, rebuild the index, and run `settings`
 #   hive upgrade [source]      pin every source (or one) to its repository's newest commit, and push
+#   hive upgrade --pr [source] propose that as a pull request in the hive instead (the daily tidy)
 #   hive settings              bring the hive's keys in Claude Code's settings up to what this
 #                               core installs, where install has run; never in a sandbox
 #   hive save [--background]   commit memory/, decisions/ and worklog/ and push them
@@ -516,36 +517,44 @@ sources_fetch() {
     fi
     while read -r name url sha; do
         [ -n "$name" ] || continue
-        dir="$hive/$name"
-        if [ ! -e "$dir/.git" ]; then
-            # Claude Code may have made an empty folder by that name; anything else there is someone's.
-            rmdir "$dir" 2>/dev/null || true
-            if [ -e "$dir" ]; then
-                fail_with "source $name: $dir exists and is not a clone; move it aside"
-                return 1
-            fi
-            if ! gnet clone -q --no-checkout "$url" "$dir" </dev/null 2>"$state/err"; then
-                rm -rf "$dir"
-                fail_with "source $name: could not clone $url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
-                return 1
-            fi
-            exclude_path "$name"
-        fi
-        # The lock's URL is where the source lives now (a fork, a moved repository), whatever the clone
-        # was made from.
-        if [ "$(gitc -C "$dir" remote get-url origin 2>/dev/null)" != "$url" ]; then
-            gitc -C "$dir" remote set-url origin "$url" 2>/dev/null || gitc -C "$dir" remote add origin "$url"
-        fi
-        gitc -C "$dir" cat-file -e "$sha^{commit}" 2>/dev/null && continue
-        # A pinned commit by name, which GitHub serves; else everything, for a server that does not.
-        gnet -C "$dir" fetch -q origin "$sha" </dev/null 2>"$state/err" || gnet -C "$dir" fetch -q origin </dev/null 2>>"$state/err" || true
-        if ! gitc -C "$dir" cat-file -e "$sha^{commit}" 2>/dev/null; then
-            fail_with "source $name: could not fetch its pinned commit $(short "$sha") from $url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
-            return 1
-        fi
+        fetch_pin "$name" "$url" "$sha" || return 1
     done <<EOF
 $list
 EOF
+}
+
+# fetch_pin <name> <url> <commit>: makes sure the clone of source <name> has <commit>, cloning it from
+# <url> if it is missing. Moves no checkout, and sets only fp_ variables: its callers loop over name, url
+# and sha.
+fetch_pin() {
+    fp_name=$1 fp_url=$2 fp_sha=$3
+    fp_dir="$hive/$fp_name"
+    if [ ! -e "$fp_dir/.git" ]; then
+        # Claude Code may have made an empty folder by that name; anything else there is someone's.
+        rmdir "$fp_dir" 2>/dev/null || true
+        if [ -e "$fp_dir" ]; then
+            fail_with "source $fp_name: $fp_dir exists and is not a clone; move it aside"
+            return 1
+        fi
+        if ! gnet clone -q --no-checkout "$fp_url" "$fp_dir" </dev/null 2>"$state/err"; then
+            rm -rf "$fp_dir"
+            fail_with "source $fp_name: could not clone $fp_url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+            return 1
+        fi
+        exclude_path "$fp_name"
+    fi
+    # The lock's URL is where the source lives now (a fork, a moved repository), whatever the clone
+    # was made from.
+    if [ "$(gitc -C "$fp_dir" config --get remote.origin.url 2>/dev/null)" != "$fp_url" ]; then
+        gitc -C "$fp_dir" remote set-url origin "$fp_url" 2>/dev/null || gitc -C "$fp_dir" remote add origin "$fp_url"
+    fi
+    gitc -C "$fp_dir" cat-file -e "$fp_sha^{commit}" 2>/dev/null && return 0
+    # A pinned commit by name, which GitHub serves; else everything, for a server that does not.
+    gnet -C "$fp_dir" fetch -q origin "$fp_sha" </dev/null 2>"$state/err" || gnet -C "$fp_dir" fetch -q origin </dev/null 2>>"$state/err" || true
+    if ! gitc -C "$fp_dir" cat-file -e "$fp_sha^{commit}" 2>/dev/null; then
+        fail_with "source $fp_name: could not fetch its pinned commit $(short "$fp_sha") from $fp_url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+        return 1
+    fi
 }
 
 # Checks every source out at the commit <commit>'s lock pins, from what is on this machine. The core
@@ -1305,6 +1314,7 @@ cmd_sync() {
     if [ "$hook" = 1 ]; then
         [ "$cold" = 1 ] || report_incoming
         report_drift
+        report_upgrade
         [ "$ok" = 1 ] || say "sync failed: $(cat "$state/error" 2>/dev/null || echo unknown). Working from the local copy at $(g rev-parse --short HEAD); memory written now is kept and pushed once sync works. Details: \`$self status\`."
     elif [ "$ok" = 1 ]; then
         say "in sync with origin/$branch at $(g rev-parse --short HEAD)"
@@ -1722,6 +1732,21 @@ recorded_shape() {
 # Tells an interactive session that the newest tidy log with "- Drift:" lines found Claude Code changing
 # how memory works, so it reaches the user's Worklog. Once for the whole hive, not per machine: the
 # marker is committed and pushed like memory, so a new sandbox is not told about drift already handled.
+# Tells an interactive session, once for the whole hive, that the newest upgrade pull request a tidy
+# logged ("- Upgrade: <URL> (<sources>)") waits for review. The marker is pushed like memory, as drift's.
+report_upgrade() {
+    [ -z "${HIVE_TIDY_SESSION:-}" ] || return 0
+    f=$(grep -l '^- Upgrade: ' "$hive"/decisions/tidy/*.md 2>/dev/null | sort | tail -n 1)
+    [ -n "$f" ] || return 0
+    entry=$(grep '^- Upgrade: ' "$f" | tail -n 1)
+    url=$(printf '%s\n' "$entry" | awk '{ print $3 }')
+    [ -n "$url" ] || return 0
+    [ "$(cat "$hive/decisions/tidy/upgrade-reported" 2>/dev/null)" = "$url" ] && return 0
+    sources=$(printf '%s\n' "$entry" | sed -n 's/^[^(]*(\(.*\))[[:space:]]*$/\1/p')
+    say "an upgrade of ${sources:-the sources} waits for your review: $url"
+    printf '%s\n' "$url" >"$hive/decisions/tidy/upgrade-reported"
+}
+
 report_drift() {
     [ -z "${HIVE_TIDY_SESSION:-}" ] || return 0
     f=$(grep -l '^- Drift: ' "$hive"/decisions/tidy/*.md 2>/dev/null | sort | tail -n 1)
@@ -1783,6 +1808,7 @@ spawn_tidy() {
             "Bash(gh pr view *)" "Bash(gh issue view *)" "Bash(gh release list *)" \
             "Bash(sh $turns *)" "Bash(sh $linked_turns *)" "Bash($self index)" "Bash(hive index)" "Bash(date *)" \
             "Bash($self usage)" "Bash($self usage *)" "Bash(hive usage)" "Bash(hive usage *)" \
+            "Bash($self upgrade --pr)" "Bash(hive upgrade --pr)" \
             </dev/null >>"$state/tidy.log" 2>&1 &
     )
     logline "started a $1 session: $2"
@@ -1894,6 +1920,122 @@ Hive-Session: ${CLAUDE_CODE_SESSION_ID:-none}" -- hive.lock
     say "upgraded$moved and pushed; this machine runs the new pins, and other machines take them at their next sync"
 }
 
+# --- upgrade pull requests --------------------------------------------------------------------------
+
+# HIVE_GH_COMMAND stands in for gh, as tests need.
+gh_command=${HIVE_GH_COMMAND:-gh}
+
+# Prints https://github.com/<owner>/<repo> for a GitHub git URL, or nothing.
+github_web() {
+    printf '%s\n' "$1" | sed -nE 's#^(https://|ssh://git@|git@)github\.com[:/]([^/]+)/([^/]+)$#\2/\3#p' |
+        sed 's/\.git$//' | awk 'NF { print "https://github.com/" $0 }'
+}
+
+# `upgrade --pr [source]`: proposes, as one pull request in the hive, pinning every source (or one) to
+# its repository's newest commit. Deterministic, for the daily tidy: the commit is built on a fixed
+# branch, hive/upgrade, from origin/main in the private worktree, so the live checkout never moves; the
+# pull request is opened once and updated after, and closed when nothing is left to upgrade. Without gh,
+# signed in, and a hive on GitHub, it says why and does nothing: the tidy logs that and moves on. Its
+# last line, for the tidy's log, is "- Upgrade: <pull request URL> (<sources>)" while one is open.
+cmd_upgrade_pr() {
+    branch_pr=hive/upgrade
+    origin_url=$(g config --get remote.origin.url 2>/dev/null || true)
+    web=$(github_web "$origin_url")
+    if ! command -v "$gh_command" >/dev/null 2>&1; then say "upgrade --pr skipped: gh is not installed"; return 0; fi
+    if ! "$gh_command" auth status >/dev/null 2>&1; then say "upgrade --pr skipped: gh is not signed in (gh auth login)"; return 0; fi
+    if [ -z "$web" ]; then say "upgrade --pr skipped: the hive's origin, ${origin_url:-none}, is not on GitHub"; return 0; fi
+    slug=${web#https://github.com/}
+    lock 30 || die "another hive command held the lock for 30 seconds; try again"
+    if ! gnet fetch -q origin "$branch" </dev/null 2>"$state/err"; then
+        die "upgrade --pr: could not fetch origin: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+    fi
+    base=$(g rev-parse "origin/$branch")
+    pins "$base" >"$state/upgrade-pins"
+    if [ -n "${1:-}" ] && ! awk -v n="$1" '$1 == n { f = 1 } END { exit !f }' "$state/upgrade-pins"; then
+        die "hive.lock pins no source named $1"
+    fi
+    open=$("$gh_command" pr list -R "$slug" --head "$branch_pr" --state open --json number,url --jq '.[0] | "\(.number) \(.url)"' 2>/dev/null || true)
+    cp "$state/upgrade-pins" "$state/upgrade-lock"
+    body="$state/upgrade-body.md"
+    : >"$body"
+    moved="" forced=""
+    while read -r name url sha; do
+        [ -z "${1:-}" ] || [ "$name" = "$1" ] || continue
+        new=$(gnet ls-remote "$url" HEAD </dev/null 2>"$state/err" | awk 'NR == 1 { print $1 }')
+        if [ -z "$new" ]; then say "upgrade --pr: could not read $url, so $name stays: $(grep -v '^hint:' "$state/err" | tail -n 1)"; continue; fi
+        [ "$new" != "$sha" ] || continue
+        if ! fetch_pin "$name" "$url" "$new" </dev/null || ! fetch_pin "$name" "$url" "$sha" </dev/null; then
+            say "upgrade --pr: $(cat "$state/error"), so $name stays"
+            continue
+        fi
+        moved="$moved $name"
+        awk -v n="$name" -v s="$new" '$1 == n && NF == 3 { $3 = s } { print }' "$state/upgrade-lock" >"$state/upgrade-lock.tmp"
+        mv "$state/upgrade-lock.tmp" "$state/upgrade-lock"
+        src=$(github_web "$url")
+        dir="$hive/$name"
+        {
+            printf '### %s: %s → %s\n\n' "$name" "$(short "$sha")" "$(short "$new")"
+            if gitc -C "$dir" merge-base --is-ancestor "$sha" "$new" 2>/dev/null; then
+                from=$sha
+            else
+                forced="$forced $name"
+                from=$(gitc -C "$dir" merge-base "$sha" "$new" 2>/dev/null || true)
+                printf '> [!WARNING]\n> **%s was force-pushed:** its newest commit does not contain the pinned one, %s. Commits only the pin had would leave this hive. Read the compare before merging.\n\n' \
+                    "$name" "$(short "$sha")"
+            fi
+            gitc -C "$dir" log --format='%H %s' "${from:+$from..}$new" | while read -r c subject; do
+                if [ -n "$src" ]; then printf -- '- [%s](%s/commit/%s) %s\n' "$(short "$c")" "$src" "$c" "$subject"
+                else printf -- '- %s %s\n' "$(short "$c")" "$subject"; fi
+            done
+            [ -z "$src" ] || printf '\nCompare: %s/compare/%s...%s\n' "$src" "$sha" "$new"
+            printf '\n'
+        } >>"$body"
+    done <"$state/upgrade-pins"
+    if [ -z "$moved" ]; then
+        if [ -n "$open" ]; then
+            "$gh_command" pr close "${open%% *}" -R "$slug" --comment "Every source is at its pin's newest commit now, so there is nothing left to upgrade." >/dev/null 2>&1 \
+                || say "upgrade --pr: could not close ${open#* }"
+        fi
+        return 0
+    fi
+    names=$(printf '%s' "$moved" | sed 's/^ //; s/ /, /g')
+    {
+        printf 'Pins %s to the newest commit of each repository'\''s default branch. Merging it is the upgrade: every machine moves to the new pins at its next sync.\n\n' "$names"
+        cat "$body"
+        # shellcheck disable=SC2016 # Markdown backticks
+        printf 'Opened by the daily tidy (`hive upgrade --pr`), which updates this pull request while it stays open.\n'
+    } >"$body.full"
+    # The commit: origin/main with the new pins, nothing else, in the private worktree.
+    worktree_at "$base" || die "upgrade --pr: $(cat "$state/error")"
+    cp "$state/upgrade-lock" "$wt/hive.lock"
+    w add -- hive.lock
+    w commit -q --no-verify -m "hive.lock: upgrade $names" -m "Hive-Host: $(where)
+Hive-Session: ${CLAUDE_CODE_SESSION_ID:-none}" -- hive.lock
+    if ! gnet push -q -f origin "$(w rev-parse HEAD):refs/heads/$branch_pr" </dev/null 2>"$state/err"; then
+        die "upgrade --pr: could not push $branch_pr: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+    fi
+    unlock
+    title="Upgrade $names"
+    if [ -n "$open" ]; then
+        number=${open%% *} url=${open#* }
+        "$gh_command" pr edit "$number" -R "$slug" --title "$title" --body-file "$body.full" >/dev/null 2>&1 || say "upgrade --pr: could not update $url"
+    else
+        url=$("$gh_command" pr create -R "$slug" --head "$branch_pr" --base "$branch" --title "$title" --body-file "$body.full" 2>"$state/err" | tail -n 1)
+        [ -n "$url" ] || die "upgrade --pr: could not open the pull request: $(tail -n 1 "$state/err")"
+        # The hive's owner reviews it; GitHub refuses a review request to the pull request's own author,
+        # so where gh acts as the owner, the owner is assigned instead.
+        owner=$("$gh_command" repo view "$slug" --json owner --jq .owner.login 2>/dev/null || true)
+        me=$("$gh_command" api user --jq .login 2>/dev/null || true)
+        if [ -n "$owner" ] && [ "$owner" = "$me" ]; then
+            "$gh_command" pr edit "$url" -R "$slug" --add-assignee "$owner" >/dev/null 2>&1 || true
+        elif [ -n "$owner" ]; then
+            "$gh_command" pr edit "$url" -R "$slug" --add-reviewer "$owner" --add-assignee "$owner" >/dev/null 2>&1 || true
+        fi
+    fi
+    [ -z "$forced" ] || say "upgrade --pr: force-pushed, flagged in the pull request:$forced"
+    printf -- '- Upgrade: %s (%s)\n' "$url" "$names"
+}
+
 cmd_usage() {
     case "${1:-30}" in ''|*[!0-9]*) die "usage: hive usage [days]" ;; esac
     scan_usage || say "could not read this machine's transcripts; reporting what is recorded"
@@ -1997,7 +2139,7 @@ case "$cmd" in
     install) cmd_install ;;
     uninstall) cmd_uninstall ;;
     sync) cmd_sync "$@" ;;
-    upgrade) cmd_upgrade "$@" ;;
+    upgrade) if [ "${1:-}" = --pr ]; then shift; cmd_upgrade_pr "$@"; else cmd_upgrade "$@"; fi ;;
     settings) cmd_settings ;;
     save) cmd_save "$@" ;;
     guard) cmd_guard ;;
@@ -2009,5 +2151,5 @@ case "$cmd" in
     costs) cmd_costs "$@" ;;
     status) cmd_status ;;
     keepalive) cmd_keepalive "$@" ;;
-    *) sed -n '2,26p' "$self" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 2 ;;
+    *) sed -n '2,27p' "$self" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 2 ;;
 esac

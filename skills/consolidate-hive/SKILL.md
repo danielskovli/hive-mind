@@ -60,7 +60,7 @@ moment cannot bring it back by accident. A tidy deletes memories retired more th
 ## Tidy mode (automatic, unattended)
 
 Work through these in order, and stop changing things once the budget holds and nothing has two
-versions; the rest can wait for the next tidy, except steps 4 to 8, which every tidy runs. Never ask
+versions; the rest can wait for the next tidy, except steps 4 to 9, which every tidy runs. Never ask
 questions: anything that needs the user goes into the log under "For the retro".
 
 1. **Two versions.** For each file containing `<!-- hive:sibling -->`: merge the versions into
@@ -108,10 +108,16 @@ questions: anything that needs the user goes into the log under "For the retro".
    with the text you would add), memories marked `promote:`, memories that only hold in
    sandboxes (for `sandbox/host-instructions.md`), and memories that are really tasks (for the
    Worklog: you have no Worklog tools here).
-8. **Log.** Append to `decisions/tidy/<today>.md` (create it with the title `# Tidy, <today>`): why
+8. **Upgrades.** Run `hive upgrade --pr`. It opens a pull request in the hive for every source whose
+   repository has moved past its pin, updates the open one, or closes it when nothing is left, and its
+   last line, while one is open, is `- Upgrade: <pull request URL> (<sources>)`. Copy that line into the
+   log under `## Upgrade`, exactly: the next interactive session tells the user from it. Whatever else it
+   prints (skipped for want of gh or a hive on GitHub, a source it could not read) goes under the same
+   heading in a line; it never stops the tidy.
+9. **Log.** Append to `decisions/tidy/<today>.md` (create it with the title `# Tidy, <today>`): why
    the tidy ran, what you merged, retired, deleted and shortened, and the rules you marked, each with
    its reason in a line;
-   memories harvested, each with its session; the drift section; the candidates; and "For the retro".
+   memories harvested, each with its session; the drift section; the upgrade section; the candidates; and "For the retro".
    Then `hive index`.
 
 ## Harvest mode (automatic, unattended)
