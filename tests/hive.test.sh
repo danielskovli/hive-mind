@@ -1271,6 +1271,76 @@ out=$(run a sync --hook 2>&1)
 check "a new upgrade pull request is told again" "printf '%s' \"\$out\" | grep -q 'upgrade of extras waits for your review: https://github.com/o/hive/pull/8'"
 run a save >/dev/null 2>&1; run b sync >/dev/null 2>&1
 
+# --- red team: upgrade pull requests against a gh that answers as GitHub's does --------------------
+
+# A second gh stub, closer to the real one: pull requests live in $tmp/ghj/prs.json, `pr list --head`
+# matches the branch name in any repository (forks too, as gh's does), --json projects the fields asked
+# for and --jq runs on the result, printing strings raw; `pr create` refuses a second open pull request
+# from the same branch, as GitHub does.
+mkdir -p "$tmp/ghj"
+cat >"$tmp/ghj/gh" <<'EOF'
+#!/bin/sh
+d=$(dirname "$0")
+printf '%s\n' "$*" >>"$d/calls"
+exec python3 -I - "$d" "$@" <<'PY'
+import json, subprocess, sys
+d, args = sys.argv[1], sys.argv[2:]
+prs = json.load(open(d + "/prs.json"))
+def opt(name):
+    return args[args.index(name) + 1] if name in args else None
+def out(value):
+    q = opt("--jq")
+    if q is None:
+        print(json.dumps(value)); return
+    sys.stdout.write(subprocess.run(["jq", "-r", q], input=json.dumps(value), capture_output=True, text=True, check=True).stdout)
+def save():
+    json.dump(prs, open(d + "/prs.json", "w"))
+def find(ref):
+    return next(p for p in prs if str(p["number"]) == ref or p["url"] == ref)
+cmd = " ".join(args[:2])
+if cmd == "auth status":
+    sys.exit(0)
+elif cmd == "api user":
+    out({"login": open(d + "/me").read().strip()})
+elif cmd == "repo view":
+    out({"owner": {"login": "o"}})
+elif cmd == "pr list":
+    head, state = opt("--head"), (opt("--state") or "open").upper()
+    rows = [p for p in prs if (head is None or p["headRefName"] == head) and (state == "ALL" or p["state"] == state)]
+    rows.sort(key=lambda p: -p["number"])
+    fields = (opt("--json") or "number").split(",")
+    out([{f: p.get(f) for f in fields} for p in rows])
+elif cmd == "pr create":
+    head = opt("--head")
+    if any(p["headRefName"] == head and not p["isCrossRepository"] and p["state"] == "OPEN" for p in prs):
+        sys.stderr.write('a pull request for branch "%s" into branch "main" already exists\n' % head); sys.exit(1)
+    n = max([p["number"] for p in prs] + [0]) + 1
+    prs.append({"number": n, "url": "https://github.com/o/hive/pull/%d" % n, "state": "OPEN", "headRefName": head,
+                "isCrossRepository": False, "headRepositoryOwner": {"login": "o"}, "body": open(opt("--body-file")).read()})
+    save(); print(prs[-1]["url"])
+elif cmd == "pr edit":
+    p = find(args[2])
+    if opt("--body-file"): p["body"] = open(opt("--body-file")).read()
+    save()
+elif cmd == "pr close":
+    find(args[2])["state"] = "CLOSED"; save()
+PY
+EOF
+chmod +x "$tmp/ghj/gh"
+echo o >"$tmp/ghj/me"
+ghj() { # <prs.json>: resets the stub's pull requests and its record of calls
+    printf '%s\n' "$1" >"$tmp/ghj/prs.json" && : >"$tmp/ghj/calls"
+}
+ghj_calls() { grep -c -- "$1" "$tmp/ghj/calls" 2>/dev/null || true; }
+prj() { (HIVE_GH_COMMAND="$tmp/ghj/gh"; export HIVE_GH_COMMAND; run pu upgrade --pr); }
+upgrade_tip() { git --git-dir="$tmp/up.git" rev-parse hive/upgrade; }
+
+# R1: gh's --jq on an empty list prints "null null", not nothing.
+ghj '[]'
+up_extras "R1 move" >/dev/null
+out=$(prj 2>&1)
+check "R1: with no upgrade pull request open, a real gh's empty answer still opens one" "[ \"\$(ghj_calls 'pr create')\" = 1 ] && [ \"\$(printf '%s\n' \"\$out\" | tail -n 1)\" = '- Upgrade: https://github.com/o/hive/pull/1 (extras)' ]"
+
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
 machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
