@@ -1382,6 +1382,15 @@ out=$(pr 2>&1); before=$(upgrade_tip); sleep 1
 out=$(pr 2>&1)
 check "R8: a run where neither main nor any source moved does not rewrite hive/upgrade" "[ \"\$(upgrade_tip)\" = '$before' ]"
 
+# R7: GitHub refuses a body over 65536 characters, so a long list must be cut.
+rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" &&
+    { i=0; from="from refs/heads/main^0"; while [ "$i" -lt 600 ]; do i=$((i + 1)); m=$(printf 'Add skill number %05d to the collection of skills' "$i")
+        printf 'commit refs/heads/main\ncommitter t <t@e> %s +0000\ndata %s\n%s\n%s' "$((1700000000 + i))" "${#m}" "$m" "${from:+$from
+}"; from=""; done; } |
+    git -C "$tmp/ux" fast-import --quiet && git -C "$tmp/ux" push -q -f origin main
+out=$(pr 2>&1); rc=$?
+check "R7: a source that moved by hundreds of commits still gets a body GitHub accepts" "[ $rc = 0 ] && [ \"\$(wc -c <'$tmp/gh/body' | tr -d ' ')\" -le 65536 ]"
+
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
 machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
