@@ -1377,6 +1377,11 @@ for line in open(sys.argv[1]):
 }
 check "R4: a source's commit subjects cannot close the hive's issues, mention people or hide lines in the body" "body_hazards '$tmp/gh/body'"
 
+# R8: a run with nothing new since the last leaves the branch as it is.
+out=$(pr 2>&1); before=$(upgrade_tip); sleep 1
+out=$(pr 2>&1)
+check "R8: a run where neither main nor any source moved does not rewrite hive/upgrade" "[ \"\$(upgrade_tip)\" = '$before' ]"
+
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
 machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
