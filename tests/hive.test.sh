@@ -32,6 +32,8 @@ git config --file "$tmp/gitconfig" maintenance.auto false
 git config --file "$tmp/gitconfig" gc.auto 0
 # The variables of the session running the tests, such as an agentctl sandbox's, stay out too.
 unset CLAUDE_CODE_SESSION_ID AGENT_NAME AGENT_HOST CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH CLAUDE_PID HIVE_KEEPALIVE_DELAY
+# Never the real gh: the upgrade pull request tests use a stub.
+export HIVE_GH_COMMAND="$tmp/no-gh"
 # Never start a real tidy session from the tests; the tidy tests use a stub.
 export HIVE_TIDY=off
 
@@ -1175,6 +1177,99 @@ python3 -c "import json,sys; p=sys.argv[1]; s=json.load(open(p)); s['awaySummary
 run sa uninstall >/dev/null 2>&1
 check "uninstall takes back the hive's keys still at its values" "! sa_has \"'theme' in s\" && sa_has \"s['attribution'] == {'sessionUrl': 'kept'}\""
 check "and leaves the ones the user changed, and the user's own" "sa_has \"s['awaySummaryEnabled'] is True and s['model'] == 'mine'\""
+
+# --- upgrade pull requests ------------------------------------------------------------------------
+
+# A gh stub: records every call in $tmp/gh/calls and answers from files there: me (gh's user), owner
+# (the hive's), open ("<number> <url>" of the open upgrade pull request), signed-out.
+mkdir -p "$tmp/gh"
+cat >"$tmp/gh/gh" <<'EOF'
+#!/bin/sh
+d=$(dirname "$0")
+printf '%s\n' "$*" >>"$d/calls"
+body=""; prev=""
+for x in "$@"; do [ "$prev" = --body-file ] && body=$x; prev=$x; done
+case "$1 $2" in
+    "auth status") [ ! -e "$d/signed-out" ] ;;
+    "api user") cat "$d/me" ;;
+    "repo view") cat "$d/owner" ;;
+    "pr list") cat "$d/open" 2>/dev/null; true ;;
+    "pr create")
+        n=$(( $(cat "$d/n" 2>/dev/null || echo 0) + 1 )) && echo "$n" >"$d/n"
+        echo "$n https://github.com/o/hive/pull/$n" >"$d/open"
+        cp "$body" "$d/body"
+        echo "https://github.com/o/hive/pull/$n" ;;
+    "pr edit") [ -z "$body" ] || cp "$body" "$d/body" ;;
+    "pr close") rm -f "$d/open" ;;
+esac
+EOF
+chmod +x "$tmp/gh/gh"
+echo o >"$tmp/gh/me" && echo o >"$tmp/gh/owner"
+gh_calls() { grep -c -- "$1" "$tmp/gh/calls" 2>/dev/null || true; }
+# GitHub URLs, served by local remotes: the hive, its core and a skills source.
+git clone -q --bare "$tmp/core.git" "$tmp/upc.git" && git clone -q --bare "$tmp/extras.git" "$tmp/upx.git" && git clone -q --bare "$tmp/remote.git" "$tmp/up.git"
+for r in hive:up hive-mind:upc extras:upx; do git config --file "$tmp/gitconfig" "url.$tmp/${r#*:}.git.insteadOf" "https://github.com/o/${r%%:*}"; done
+git clone -q "$tmp/up.git" "$tmp/up-pr" &&
+    printf 'hive-mind https://github.com/o/hive-mind %s\nextras https://github.com/o/extras %s\n' "$(tip upc)" "$(tip upx)" >"$tmp/up-pr/hive.lock" &&
+    git -C "$tmp/up-pr" commit -qam "sources on GitHub" && git -C "$tmp/up-pr" push -q origin main
+machine pu https://github.com/o/hive && run pu install >/dev/null 2>&1
+pr() { (HIVE_GH_COMMAND="$tmp/gh/gh"; export HIVE_GH_COMMAND; run pu upgrade --pr); }
+up_extras() { # <subject>: a new commit in the extras source; prints it
+    rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" && echo "$1" >>"$tmp/ux/NOTES" && git -C "$tmp/ux" add NOTES &&
+        git -C "$tmp/ux" commit -qm "$1" && git -C "$tmp/ux" push -q -f origin HEAD:main && git -C "$tmp/ux" rev-parse HEAD
+}
+pu_head=$(git -C "$tmp/pu/hive" rev-parse HEAD)
+
+out=$(run pu upgrade --pr 2>&1); rc=$?
+check "upgrade --pr without gh says so and succeeds, for the tidy" "[ $rc = 0 ] && printf '%s' \"\$out\" | grep -q 'upgrade --pr skipped: gh is not installed'"
+touch "$tmp/gh/signed-out"; out=$(pr 2>&1); rc=$?; rm "$tmp/gh/signed-out"
+check "so does gh signed out" "[ $rc = 0 ] && printf '%s' \"\$out\" | grep -q 'skipped: gh is not signed in'"
+out=$( (HIVE_GH_COMMAND="$tmp/gh/gh"; export HIVE_GH_COMMAND; run a upgrade --pr) 2>&1); rc=$?
+check "so does a hive whose origin is not on GitHub" "[ $rc = 0 ] && printf '%s' \"\$out\" | grep -q 'skipped: the hive.s origin, .* is not on GitHub'"
+
+echo "5 https://github.com/o/hive/pull/5" >"$tmp/gh/open"
+out=$(pr 2>&1); rc=$?
+check "with nothing to upgrade, it opens nothing and closes an open upgrade pull request, quietly" "[ $rc = 0 ] && [ -z \"\$out\" ] && [ \"\$(gh_calls 'pr create')\" = 0 ] && grep -q '^pr close 5 .*--comment' '$tmp/gh/calls' && [ ! -e '$tmp/gh/open' ]"
+
+u1=$(up_extras "Add the first upgrade")
+out=$(pr 2>&1); rc=$?
+check "a moved source opens a pull request, and says so last, for the tidy's log" "[ $rc = 0 ] && [ \"\$(gh_calls 'pr create')\" = 1 ] && [ \"\$(printf '%s\n' \"\$out\" | tail -n 1)\" = '- Upgrade: https://github.com/o/hive/pull/1 (extras)' ]"
+check "its branch is origin/main with only hive.lock changed, to the new pin" "[ \"\$(git --git-dir='$tmp/up.git' rev-parse hive/upgrade~1)\" = \"\$(git --git-dir='$tmp/up.git' rev-parse main)\" ] && [ \"\$(git --git-dir='$tmp/up.git' diff --name-only main hive/upgrade)\" = hive.lock ] && git --git-dir='$tmp/up.git' show hive/upgrade:hive.lock | grep -q '^extras https://github.com/o/extras $u1\$'"
+check "the pull request lists the incoming commits, linked, and the compare" "grep -qF \"https://github.com/o/extras/commit/$u1) Add the first upgrade\" '$tmp/gh/body' && grep -q 'https://github.com/o/extras/compare/' '$tmp/gh/body' && ! grep -q 'force-pushed' '$tmp/gh/body'"
+check "where gh acts as the hive's owner, the owner is assigned, not asked to review" "grep -q '^pr edit https://github.com/o/hive/pull/1 .*--add-assignee o' '$tmp/gh/calls' && ! grep -q -- '--add-reviewer' '$tmp/gh/calls'"
+check "the live checkout never moves" "[ \"\$(git -C '$tmp/pu/hive' rev-parse HEAD)\" = '$pu_head' ] && [ -z \"\$(git -C '$tmp/pu/hive' status --porcelain)\" ] && ! grep -q '$u1' '$tmp/pu/hive/hive.lock'"
+
+u2=$(up_extras "Add the second upgrade")
+out=$(pr 2>&1)
+check "the next run updates the open pull request rather than opening another" "[ \"\$(gh_calls 'pr create')\" = 1 ] && grep -q '^pr edit 1 .*--body-file' '$tmp/gh/calls' && grep -q 'Add the second upgrade' '$tmp/gh/body' && git --git-dir='$tmp/up.git' show hive/upgrade:hive.lock | grep -q '$u2'"
+
+rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" && git -C "$tmp/ux" reset -q --hard HEAD~3 && echo other >"$tmp/ux/OTHER" && git -C "$tmp/ux" add OTHER &&
+    git -C "$tmp/ux" commit -qm "Rewrite history" && git -C "$tmp/ux" push -q -f origin HEAD:main
+out=$(pr 2>&1)
+check "a source force-pushed past its pin is flagged" "grep -q 'extras was force-pushed' '$tmp/gh/body' && printf '%s' \"\$out\" | grep -q 'force-pushed, flagged in the pull request: extras'"
+
+rm -f "$tmp/gh/open"; echo bot >"$tmp/gh/me"
+out=$(pr 2>&1)
+check "where gh acts as someone else, the owner is asked to review and assigned" "grep -q '^pr edit https://github.com/o/hive/pull/2 .*--add-reviewer o --add-assignee o' '$tmp/gh/calls'"
+check "the live checkout still has not moved" "[ \"\$(git -C '$tmp/pu/hive' rev-parse HEAD)\" = '$pu_head' ] && [ -z \"\$(git -C '$tmp/pu/hive' status --porcelain)\" ]"
+
+# A session start tells the user once per hive that an upgrade waits, from the tidy's log line.
+mkdir -p "$a/hive/decisions/tidy"
+printf '\n## Upgrade\n\n- Upgrade: https://github.com/o/hive/pull/7 (extras, hive-mind)\n' >>"$a/hive/decisions/tidy/$today.md"
+run a save >/dev/null 2>&1
+out=$(run b sync --hook 2>&1)
+check "a session start says an upgrade waits for review" "printf '%s' \"\$out\" | grep -qx 'hive: an upgrade of extras, hive-mind waits for your review: https://github.com/o/hive/pull/7'"
+out=$(run b sync --hook 2>&1)
+check "and says it once" "! printf '%s' \"\$out\" | grep -q 'waits for your review'"
+run b save >/dev/null 2>&1
+out=$(run a sync --hook 2>&1)
+check "once for the whole hive, not once per machine" "! printf '%s' \"\$out\" | grep -q 'waits for your review'"
+out=$( (HIVE_TIDY_SESSION=1; export HIVE_TIDY_SESSION; run c sync --hook) 2>&1)
+check "a tidy session is not told" "! printf '%s' \"\$out\" | grep -q 'waits for your review'"
+printf -- '- Upgrade: https://github.com/o/hive/pull/8 (extras)\n' >>"$a/hive/decisions/tidy/$today.md"
+out=$(run a sync --hook 2>&1)
+check "a new upgrade pull request is told again" "printf '%s' \"\$out\" | grep -q 'upgrade of extras waits for your review: https://github.com/o/hive/pull/8'"
+run a save >/dev/null 2>&1; run b sync >/dev/null 2>&1
 
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
