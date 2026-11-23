@@ -1180,32 +1180,87 @@ check "and leaves the ones the user changed, and the user's own" "sa_has \"s['aw
 
 # --- upgrade pull requests ------------------------------------------------------------------------
 
-# A gh stub: records every call in $tmp/gh/calls and answers from files there: me (gh's user), owner
-# (the hive's), open ("<number> <url>" of the open upgrade pull request), signed-out.
+# A gh stub that answers as GitHub's does: pull requests live in $tmp/gh/prs.json; `pr list --head`
+# matches the branch name in any repository (forks too) and --state closed takes merged ones in; --json
+# projects the fields asked for and --jq runs real jq on the result, printing strings raw (so an empty
+# list's .[0] prints "null"); `pr create` refuses a second open pull request from one branch. It records
+# every call in calls, and the latest body in body. Files there steer it: me (gh's user), owner, org
+# (true for an organisation's hive), signed-out, list-fails, review-fails, view-state (what `pr view`
+# says, as when a pull request is merged mid-run).
 mkdir -p "$tmp/gh"
 cat >"$tmp/gh/gh" <<'EOF'
 #!/bin/sh
 d=$(dirname "$0")
 printf '%s\n' "$*" >>"$d/calls"
-body=""; prev=""
-for x in "$@"; do [ "$prev" = --body-file ] && body=$x; prev=$x; done
-case "$1 $2" in
-    "auth status") [ ! -e "$d/signed-out" ] ;;
-    "api user") cat "$d/me" ;;
-    "repo view") cat "$d/owner" ;;
-    "pr list") cat "$d/open" 2>/dev/null; true ;;
-    "pr create")
-        n=$(( $(cat "$d/n" 2>/dev/null || echo 0) + 1 )) && echo "$n" >"$d/n"
-        echo "$n https://github.com/o/hive/pull/$n" >"$d/open"
-        cp "$body" "$d/body"
-        echo "https://github.com/o/hive/pull/$n" ;;
-    "pr edit") [ -z "$body" ] || cp "$body" "$d/body" ;;
-    "pr close") rm -f "$d/open" ;;
-esac
+exec python3 -I - "$d" "$@" <<'PY'
+import json, os, subprocess, sys
+d, args = sys.argv[1], sys.argv[2:]
+prs = json.load(open(d + "/prs.json"))
+def opt(name):
+    return args[args.index(name) + 1] if name in args else None
+def read(name, default=""):
+    try:
+        return open(os.path.join(d, name)).read().strip()
+    except OSError:
+        return default
+def out(value):
+    q = opt("--jq")
+    if q is None:
+        print(json.dumps(value)); return
+    r = subprocess.run(["jq", "-r", q], input=json.dumps(value), capture_output=True, text=True)
+    sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
+def save():
+    json.dump(prs, open(d + "/prs.json", "w"))
+def find(ref):
+    return next(p for p in prs if str(p["number"]) == ref or p["url"] == ref)
+def keep_body(p):
+    if opt("--body-file"):
+        p["body"] = open(opt("--body-file")).read()
+        open(d + "/body", "w").write(p["body"])
+cmd = " ".join(args[:2])
+if cmd == "auth status":
+    sys.exit(1 if os.path.exists(d + "/signed-out") else 0)
+elif cmd == "api user":
+    out({"login": read("me")})
+elif cmd == "repo view":
+    out({"owner": {"login": read("owner", "o")}, "isInOrganization": read("org", "false") == "true"})
+elif cmd == "pr list":
+    if os.path.exists(d + "/list-fails"):
+        sys.stderr.write("HTTP 502: Bad Gateway\n"); sys.exit(1)
+    head, state = opt("--head"), (opt("--state") or "open").upper()
+    rows = [p for p in prs if (head is None or p["headRefName"] == head)
+            and (state == "ALL" or p["state"] == state or (state == "CLOSED" and p["state"] == "MERGED"))]
+    rows.sort(key=lambda p: -p["number"])
+    fields = (opt("--json") or "number").split(",")
+    out([{f: p.get(f) for f in fields} for p in rows])
+elif cmd == "pr view":
+    out({"state": read("view-state") or find(args[2])["state"]})
+elif cmd == "pr create":
+    head = opt("--head")
+    if any(p["headRefName"] == head and not p["isCrossRepository"] and p["state"] == "OPEN" for p in prs):
+        sys.stderr.write('a pull request for branch "%s" into branch "main" already exists\n' % head); sys.exit(1)
+    n = max([p["number"] for p in prs] + [0]) + 1
+    p = {"number": n, "url": "https://github.com/o/hive/pull/%d" % n, "state": "OPEN", "headRefName": head,
+         "baseRefName": opt("--base"), "isCrossRepository": False, "mergedAt": None}
+    keep_body(p); prs.append(p); save(); print(p["url"])
+elif cmd == "pr edit":
+    p = find(args[2]); keep_body(p); save()
+    if "--add-reviewer" in args and os.path.exists(d + "/review-fails"):
+        sys.stderr.write("could not request a review\n"); sys.exit(1)
+elif cmd == "pr close":
+    find(args[2])["state"] = "CLOSED"; save()
+PY
 EOF
 chmod +x "$tmp/gh/gh"
-echo o >"$tmp/gh/me" && echo o >"$tmp/gh/owner"
+echo o >"$tmp/gh/me"
+ghj() { # <prs.json>: resets the stub's pull requests and its record of calls
+    printf '%s\n' "$1" >"$tmp/gh/prs.json" && : >"$tmp/gh/calls"
+}
+ours_pr() { # <number> <state> [body]: one of our upgrade pull requests, as gh lists it
+    printf '{"number": %s, "url": "https://github.com/o/hive/pull/%s", "state": "%s", "headRefName": "hive/upgrade", "baseRefName": "main", "isCrossRepository": false, "mergedAt": null, "body": "%s"}' "$1" "$1" "$2" "${3:-x}"
+}
 gh_calls() { grep -c -- "$1" "$tmp/gh/calls" 2>/dev/null || true; }
+ghj '[]'
 # GitHub URLs, served by local remotes: the hive, its core and a skills source.
 git clone -q --bare "$tmp/core.git" "$tmp/upc.git" && git clone -q --bare "$tmp/extras.git" "$tmp/upx.git" && git clone -q --bare "$tmp/remote.git" "$tmp/up.git"
 for r in hive:up hive-mind:upc extras:upx; do git config --file "$tmp/gitconfig" "url.$tmp/${r#*:}.git.insteadOf" "https://github.com/o/${r%%:*}"; done
@@ -1218,24 +1273,27 @@ up_extras() { # <subject>: a new commit in the extras source; prints it
     rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" && echo "$1" >>"$tmp/ux/NOTES" && git -C "$tmp/ux" add NOTES &&
         git -C "$tmp/ux" commit -qm "$1" && git -C "$tmp/ux" push -q -f origin HEAD:main && git -C "$tmp/ux" rev-parse HEAD
 }
+upgrade_tip() { git --git-dir="$tmp/up.git" rev-parse hive/upgrade; }
 pu_head=$(git -C "$tmp/pu/hive" rev-parse HEAD)
 
 out=$(run pu upgrade --pr 2>&1); rc=$?
 check "upgrade --pr without gh says so and succeeds, for the tidy" "[ $rc = 0 ] && printf '%s' \"\$out\" | grep -q 'upgrade --pr skipped: gh is not installed'"
 touch "$tmp/gh/signed-out"; out=$(pr 2>&1); rc=$?; rm "$tmp/gh/signed-out"
-check "so does gh signed out" "[ $rc = 0 ] && printf '%s' \"\$out\" | grep -q 'skipped: gh is not signed in'"
+check "so does gh signed out of github.com, asking about github.com's active account only" "[ $rc = 0 ] && printf '%s' \"\$out\" | grep -q 'skipped: gh is not signed in to github.com' && grep -q '^auth status --hostname github.com --active' '$tmp/gh/calls'"
 out=$( (HIVE_GH_COMMAND="$tmp/gh/gh"; export HIVE_GH_COMMAND; run a upgrade --pr) 2>&1); rc=$?
 check "so does a hive whose origin is not on GitHub" "[ $rc = 0 ] && printf '%s' \"\$out\" | grep -q 'skipped: the hive.s origin, .* is not on GitHub'"
 
-echo "5 https://github.com/o/hive/pull/5" >"$tmp/gh/open"
+ghj "[$(ours_pr 5 OPEN)]"
 out=$(pr 2>&1); rc=$?
-check "with nothing to upgrade, it opens nothing and closes an open upgrade pull request, quietly" "[ $rc = 0 ] && [ -z \"\$out\" ] && [ \"\$(gh_calls 'pr create')\" = 0 ] && grep -q '^pr close 5 .*--comment' '$tmp/gh/calls' && [ ! -e '$tmp/gh/open' ]"
+check "with nothing to upgrade, it opens nothing, closes the open upgrade pull request, and says so for the log" "[ $rc = 0 ] && [ \"\$out\" = '- Upgrade: closed https://github.com/o/hive/pull/5' ] && [ \"\$(gh_calls 'pr create')\" = 0 ] && grep -q '^pr close 5 .*--comment' '$tmp/gh/calls'"
 
+# R1: gh's --jq on an empty list prints "null null", not nothing.
+ghj '[]'
 u1=$(up_extras "Add the first upgrade")
 out=$(pr 2>&1); rc=$?
-check "a moved source opens a pull request, and says so last, for the tidy's log" "[ $rc = 0 ] && [ \"\$(gh_calls 'pr create')\" = 1 ] && [ \"\$(printf '%s\n' \"\$out\" | tail -n 1)\" = '- Upgrade: https://github.com/o/hive/pull/1 (extras)' ]"
+check "R1: with no upgrade pull request open, a real gh's empty answer still opens one, and says so last" "[ $rc = 0 ] && [ \"\$(gh_calls 'pr create')\" = 1 ] && [ \"\$(printf '%s\n' \"\$out\" | tail -n 1)\" = '- Upgrade: https://github.com/o/hive/pull/1 (extras)' ]"
 check "its branch is origin/main with only hive.lock changed, to the new pin" "[ \"\$(git --git-dir='$tmp/up.git' rev-parse hive/upgrade~1)\" = \"\$(git --git-dir='$tmp/up.git' rev-parse main)\" ] && [ \"\$(git --git-dir='$tmp/up.git' diff --name-only main hive/upgrade)\" = hive.lock ] && git --git-dir='$tmp/up.git' show hive/upgrade:hive.lock | grep -q '^extras https://github.com/o/extras $u1\$'"
-check "the pull request lists the incoming commits, linked, and the compare" "grep -qF \"https://github.com/o/extras/commit/$u1) Add the first upgrade\" '$tmp/gh/body' && grep -q 'https://github.com/o/extras/compare/' '$tmp/gh/body' && ! grep -q 'force-pushed' '$tmp/gh/body'"
+check "the pull request lists the incoming commits, linked, and the compare" "grep -F \"https://github.com/o/extras/commit/$u1)\" '$tmp/gh/body' | grep -qF 'Add the first upgrade' && grep -q 'https://github.com/o/extras/compare/' '$tmp/gh/body' && ! grep -q 'force-pushed' '$tmp/gh/body'"
 check "where gh acts as the hive's owner, the owner is assigned, not asked to review" "grep -q '^pr edit https://github.com/o/hive/pull/1 .*--add-assignee o' '$tmp/gh/calls' && ! grep -q -- '--add-reviewer' '$tmp/gh/calls'"
 check "the live checkout never moves" "[ \"\$(git -C '$tmp/pu/hive' rev-parse HEAD)\" = '$pu_head' ] && [ -z \"\$(git -C '$tmp/pu/hive' status --porcelain)\" ] && ! grep -q '$u1' '$tmp/pu/hive/hive.lock'"
 
@@ -1243,117 +1301,52 @@ u2=$(up_extras "Add the second upgrade")
 out=$(pr 2>&1)
 check "the next run updates the open pull request rather than opening another" "[ \"\$(gh_calls 'pr create')\" = 1 ] && grep -q '^pr edit 1 .*--body-file' '$tmp/gh/calls' && grep -q 'Add the second upgrade' '$tmp/gh/body' && git --git-dir='$tmp/up.git' show hive/upgrade:hive.lock | grep -q '$u2'"
 
-rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" && git -C "$tmp/ux" reset -q --hard HEAD~3 && echo other >"$tmp/ux/OTHER" && git -C "$tmp/ux" add OTHER &&
+# R8: a run with nothing new since the last leaves the branch and the pull request as they are.
+before=$(upgrade_tip); : >"$tmp/gh/calls"; sleep 1
+out=$(pr 2>&1)
+check "R8: a run where neither main nor any source moved does not rewrite hive/upgrade" "[ \"\$(upgrade_tip)\" = '$before' ] && ! grep -q '^pr edit' '$tmp/gh/calls' && [ \"\$(printf '%s\n' \"\$out\" | tail -n 1)\" = '- Upgrade: https://github.com/o/hive/pull/1 (extras)' ]"
+
+# A pull request merged while the run worked is neither edited nor logged as waiting.
+up_extras "Add a third upgrade" >/dev/null; echo MERGED >"$tmp/gh/view-state"; : >"$tmp/gh/calls"
+out=$(pr 2>&1); rm "$tmp/gh/view-state"
+check "a pull request merged mid-run is not edited, nor logged as waiting" "! grep -q '^pr edit' '$tmp/gh/calls' && printf '%s' \"\$out\" | grep -q 'merged or closed meanwhile' && ! printf '%s' \"\$out\" | grep -q '^- Upgrade: '"
+
+# A failed pull request list stops the run before anything is pushed.
+up_extras "Add a fourth upgrade" >/dev/null; before=$(upgrade_tip); touch "$tmp/gh/list-fails"
+out=$(pr 2>&1); rc=$?; rm "$tmp/gh/list-fails"
+check "a failed pull request list stops before any push, without failing the tidy" "[ $rc = 0 ] && [ \"\$(upgrade_tip)\" = '$before' ] && printf '%s' \"\$out\" | grep -q 'could not list the hive.s pull requests: HTTP 502'"
+
+rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" && git -C "$tmp/ux" reset -q --hard "$u1~2" && echo other >"$tmp/ux/OTHER" && git -C "$tmp/ux" add OTHER &&
     git -C "$tmp/ux" commit -qm "Rewrite history" && git -C "$tmp/ux" push -q -f origin HEAD:main
 out=$(pr 2>&1)
-check "a source force-pushed past its pin is flagged" "grep -q 'extras was force-pushed' '$tmp/gh/body' && printf '%s' \"\$out\" | grep -q 'force-pushed, flagged in the pull request: extras'"
+check "a source force-pushed past its pin is flagged" "grep -q 'extras was force-pushed' '$tmp/gh/body' && printf '%s' \"\$out\" | grep -q 'flagged in the pull request, its history rewritten: extras'"
 
-rm -f "$tmp/gh/open"; echo bot >"$tmp/gh/me"
-out=$(pr 2>&1)
-check "where gh acts as someone else, the owner is asked to review and assigned" "grep -q '^pr edit https://github.com/o/hive/pull/2 .*--add-reviewer o --add-assignee o' '$tmp/gh/calls'"
+# Who reviews: the owner, asked and assigned, where gh acts as someone else; one refused call does not
+# drop the other; in an organisation's hive, the one gh acts as is assigned.
+ghj '[]'; echo bot >"$tmp/gh/me"; touch "$tmp/gh/review-fails"
+out=$(pr 2>&1); rm "$tmp/gh/review-fails"
+check "where gh acts as someone else, the owner is assigned and asked to review, each on its own" "grep -q '^pr edit https://github.com/o/hive/pull/1 -R o/hive --add-assignee o\$' '$tmp/gh/calls' && grep -q '^pr edit https://github.com/o/hive/pull/1 -R o/hive --add-reviewer o\$' '$tmp/gh/calls' && printf '%s' \"\$out\" | grep -q 'could not ask o to review'"
+ghj '[]'; echo true >"$tmp/gh/org"
+out=$(pr 2>&1); rm "$tmp/gh/org"; echo o >"$tmp/gh/me"
+check "in an organisation's hive, no review is asked of the organisation, and gh's user is assigned" "grep -q '^pr edit https://github.com/o/hive/pull/1 -R o/hive --add-assignee bot\$' '$tmp/gh/calls' && ! grep -q -- '--add-reviewer' '$tmp/gh/calls'"
 check "the live checkout still has not moved" "[ \"\$(git -C '$tmp/pu/hive' rev-parse HEAD)\" = '$pu_head' ] && [ -z \"\$(git -C '$tmp/pu/hive' status --porcelain)\" ]"
 
-# A session start tells the user once per hive that an upgrade waits, from the tidy's log line.
-mkdir -p "$a/hive/decisions/tidy"
-printf '\n## Upgrade\n\n- Upgrade: https://github.com/o/hive/pull/7 (extras, hive-mind)\n' >>"$a/hive/decisions/tidy/$today.md"
-run a save >/dev/null 2>&1
-out=$(run b sync --hook 2>&1)
-check "a session start says an upgrade waits for review" "printf '%s' \"\$out\" | grep -qx 'hive: an upgrade of extras, hive-mind waits for your review: https://github.com/o/hive/pull/7'"
-out=$(run b sync --hook 2>&1)
-check "and says it once" "! printf '%s' \"\$out\" | grep -q 'waits for your review'"
-run b save >/dev/null 2>&1
-out=$(run a sync --hook 2>&1)
-check "once for the whole hive, not once per machine" "! printf '%s' \"\$out\" | grep -q 'waits for your review'"
-out=$( (HIVE_TIDY_SESSION=1; export HIVE_TIDY_SESSION; run c sync --hook) 2>&1)
-check "a tidy session is not told" "! printf '%s' \"\$out\" | grep -q 'waits for your review'"
-printf -- '- Upgrade: https://github.com/o/hive/pull/8 (extras)\n' >>"$a/hive/decisions/tidy/$today.md"
-out=$(run a sync --hook 2>&1)
-check "a new upgrade pull request is told again" "printf '%s' \"\$out\" | grep -q 'upgrade of extras waits for your review: https://github.com/o/hive/pull/8'"
-run a save >/dev/null 2>&1; run b sync >/dev/null 2>&1
-
-# --- red team: upgrade pull requests against a gh that answers as GitHub's does --------------------
-
-# A second gh stub, closer to the real one: pull requests live in $tmp/ghj/prs.json, `pr list --head`
-# matches the branch name in any repository (forks too, as gh's does), --json projects the fields asked
-# for and --jq runs on the result, printing strings raw; `pr create` refuses a second open pull request
-# from the same branch, as GitHub does.
-mkdir -p "$tmp/ghj"
-cat >"$tmp/ghj/gh" <<'EOF'
-#!/bin/sh
-d=$(dirname "$0")
-printf '%s\n' "$*" >>"$d/calls"
-exec python3 -I - "$d" "$@" <<'PY'
-import json, subprocess, sys
-d, args = sys.argv[1], sys.argv[2:]
-prs = json.load(open(d + "/prs.json"))
-def opt(name):
-    return args[args.index(name) + 1] if name in args else None
-def out(value):
-    q = opt("--jq")
-    if q is None:
-        print(json.dumps(value)); return
-    sys.stdout.write(subprocess.run(["jq", "-r", q], input=json.dumps(value), capture_output=True, text=True, check=True).stdout)
-def save():
-    json.dump(prs, open(d + "/prs.json", "w"))
-def find(ref):
-    return next(p for p in prs if str(p["number"]) == ref or p["url"] == ref)
-cmd = " ".join(args[:2])
-if cmd == "auth status":
-    sys.exit(0)
-elif cmd == "api user":
-    out({"login": open(d + "/me").read().strip()})
-elif cmd == "repo view":
-    out({"owner": {"login": "o"}})
-elif cmd == "pr list":
-    head, state = opt("--head"), (opt("--state") or "open").upper()
-    rows = [p for p in prs if (head is None or p["headRefName"] == head) and (state == "ALL" or p["state"] == state)]
-    rows.sort(key=lambda p: -p["number"])
-    fields = (opt("--json") or "number").split(",")
-    out([{f: p.get(f) for f in fields} for p in rows])
-elif cmd == "pr create":
-    head = opt("--head")
-    if any(p["headRefName"] == head and not p["isCrossRepository"] and p["state"] == "OPEN" for p in prs):
-        sys.stderr.write('a pull request for branch "%s" into branch "main" already exists\n' % head); sys.exit(1)
-    n = max([p["number"] for p in prs] + [0]) + 1
-    prs.append({"number": n, "url": "https://github.com/o/hive/pull/%d" % n, "state": "OPEN", "headRefName": head,
-                "isCrossRepository": False, "headRepositoryOwner": {"login": "o"}, "body": open(opt("--body-file")).read()})
-    save(); print(prs[-1]["url"])
-elif cmd == "pr edit":
-    p = find(args[2])
-    if opt("--body-file"): p["body"] = open(opt("--body-file")).read()
-    save()
-elif cmd == "pr close":
-    find(args[2])["state"] = "CLOSED"; save()
-PY
-EOF
-chmod +x "$tmp/ghj/gh"
-echo o >"$tmp/ghj/me"
-ghj() { # <prs.json>: resets the stub's pull requests and its record of calls
-    printf '%s\n' "$1" >"$tmp/ghj/prs.json" && : >"$tmp/ghj/calls"
-}
-ghj_calls() { grep -c -- "$1" "$tmp/ghj/calls" 2>/dev/null || true; }
-prj() { (HIVE_GH_COMMAND="$tmp/ghj/gh"; export HIVE_GH_COMMAND; run pu upgrade --pr); }
-upgrade_tip() { git --git-dir="$tmp/up.git" rev-parse hive/upgrade; }
-
-# R1: gh's --jq on an empty list prints "null null", not nothing.
-ghj '[]'
-up_extras "R1 move" >/dev/null
-out=$(prj 2>&1)
-check "R1: with no upgrade pull request open, a real gh's empty answer still opens one" "[ \"\$(ghj_calls 'pr create')\" = 1 ] && [ \"\$(printf '%s\n' \"\$out\" | tail -n 1)\" = '- Upgrade: https://github.com/o/hive/pull/1 (extras)' ]"
-
 # R2: someone's fork has a branch named hive/upgrade too, with a pull request open from it.
-ghj '[{"number": 41, "url": "https://github.com/o/hive/pull/41", "state": "OPEN", "headRefName": "hive/upgrade", "isCrossRepository": true, "headRepositoryOwner": {"login": "mallory"}, "body": "x"}]'
+ghj '[{"number": 41, "url": "https://github.com/o/hive/pull/41", "state": "OPEN", "headRefName": "hive/upgrade", "baseRefName": "main", "isCrossRepository": true, "mergedAt": null, "body": "x"}]'
 up_extras "R2 move" >/dev/null
-out=$(prj 2>&1)
-check "R2: a pull request from a fork's hive/upgrade is never taken for the upgrade one, retitled or rewritten" "! grep -q '^pr edit 41 ' '$tmp/ghj/calls' && ! printf '%s' \"\$out\" | grep -q 'pull/41'"
+out=$(pr 2>&1)
+check "R2: a pull request from a fork's hive/upgrade is never taken for the upgrade one, retitled or rewritten" "! grep -q '^pr edit 41 ' '$tmp/gh/calls' && ! printf '%s' \"\$out\" | grep -q 'pull/41'"
 
-# R5: the user closed the upgrade pull request without merging it, and no source has moved since.
+# R5: the user closed the upgrade pull request without merging it: those pins are turned down until a
+# source moves past them.
 ghj '[]'
-rm -f "$tmp/gh/open"; out=$(pr 2>&1)
-closed=$(printf '%s\n' "$out" | tail -n 1 | awk '{ print $3 }')
-ghj "[{\"number\": 9, \"url\": \"$closed\", \"state\": \"CLOSED\", \"headRefName\": \"hive/upgrade\", \"isCrossRepository\": false, \"headRepositoryOwner\": {\"login\": \"o\"}, \"body\": \"x\"}]"
-out=$(prj 2>&1)
-check "R5: an upgrade the user closed unmerged is not proposed again until a source moves further" "[ \"\$(ghj_calls 'pr create')\" = 0 ] && ! grep -q '^pr edit' '$tmp/ghj/calls' && ! printf '%s' \"\$out\" | grep -q '^- Upgrade: '"
+out=$(pr 2>&1)
+"$tmp/gh/gh" pr close 1 -R o/hive >/dev/null && : >"$tmp/gh/calls"
+out=$(pr 2>&1)
+check "R5: an upgrade the user closed unmerged is not proposed again until a source moves further" "[ \"\$(gh_calls 'pr create')\" = 0 ] && ! grep -q '^pr edit' '$tmp/gh/calls' && ! printf '%s' \"\$out\" | grep -q '^- Upgrade: '"
+up_extras "Moves past the turned-down pins" >/dev/null
+out=$(pr 2>&1)
+check "and once a source moves past them, a new one is proposed" "[ \"\$(gh_calls 'pr create')\" = 1 ] && [ \"\$(printf '%s\n' \"\$out\" | tail -n 1)\" = '- Upgrade: https://github.com/o/hive/pull/2 (extras)' ]"
 
 # R3: hive.lock may hold comments; the pull request changes pins, nothing else.
 rm -rf "$tmp/up-c" && git clone -q "$tmp/up.git" "$tmp/up-c" &&
@@ -1366,21 +1359,17 @@ check "R3: the upgrade pull request keeps hive.lock's comments and blank lines, 
 # R4: commit subjects come from the source's authors, and GitHub renders the body.
 up_extras "Fixes #1, thanks @someone" >/dev/null
 up_extras "<!-- hides every older commit below" >/dev/null
+up_extras 'A subject with `backticks` in it' >/dev/null
 out=$(pr 2>&1)
 # Fails when a line of <body>, code spans aside, holds an HTML comment, the mention or the closing keyword.
 body_hazards() {
     python3 -I -c 'import re, sys
 for line in open(sys.argv[1]):
-    bare = re.sub(r"`[^`]*`", "", line)
+    bare = re.sub(r"(`+).*?\1", "", line)
     if "<!--" in bare or "@someone" in bare or re.search(r"(?i)fixes #1", bare):
         sys.exit(1)' "$1"
 }
-check "R4: a source's commit subjects cannot close the hive's issues, mention people or hide lines in the body" "body_hazards '$tmp/gh/body'"
-
-# R8: a run with nothing new since the last leaves the branch as it is.
-out=$(pr 2>&1); before=$(upgrade_tip); sleep 1
-out=$(pr 2>&1)
-check "R8: a run where neither main nor any source moved does not rewrite hive/upgrade" "[ \"\$(upgrade_tip)\" = '$before' ]"
+check "R4: a source's commit subjects cannot close the hive's issues, mention people or hide lines in the body" "body_hazards '$tmp/gh/body' && grep -qF '\`\` A subject with \`backticks\` in it \`\`' '$tmp/gh/body'"
 
 # R7: GitHub refuses a body over 65536 characters, so a long list must be cut.
 rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" &&
@@ -1389,7 +1378,29 @@ rm -rf "$tmp/ux" && git clone -q "$tmp/upx.git" "$tmp/ux" &&
 }"; from=""; done; } |
     git -C "$tmp/ux" fast-import --quiet && git -C "$tmp/ux" push -q -f origin main
 out=$(pr 2>&1); rc=$?
-check "R7: a source that moved by hundreds of commits still gets a body GitHub accepts" "[ $rc = 0 ] && [ \"\$(wc -c <'$tmp/gh/body' | tr -d ' ')\" -le 65536 ]"
+check "R7: a source that moved by hundreds of commits still gets a body GitHub accepts" "[ $rc = 0 ] && [ \"\$(wc -c <'$tmp/gh/body' | tr -d ' ')\" -le 65536 ] && grep -q 'and [0-9]* more, in the compare below' '$tmp/gh/body'"
+
+# A session start tells the user once per hive that an upgrade waits, from the newest tidy log's line.
+mkdir -p "$a/hive/decisions/tidy"
+printf '\n## Upgrade\n\n- Upgrade: https://github.com/o/hive/pull/7 (extras, hive-mind)\n' >>"$a/hive/decisions/tidy/$today.md"
+run a save >/dev/null 2>&1
+out=$(run b sync --hook 2>&1)
+check "a session start says an upgrade waits for review" "printf '%s' \"\$out\" | grep -qx 'hive: an upgrade of extras, hive-mind waits for your review: https://github.com/o/hive/pull/7'"
+out=$(run b sync --hook 2>&1)
+check "and says it once" "! printf '%s' \"\$out\" | grep -q 'waits for your review'"
+run b save >/dev/null 2>&1
+out=$(run a sync --hook 2>&1)
+check "once for the whole hive, not once per machine" "! printf '%s' \"\$out\" | grep -q 'waits for your review'"
+printf -- '- Upgrade: https://github.com/o/hive/pull/8 (extras)\n' >>"$a/hive/decisions/tidy/$today.md"
+run a save >/dev/null 2>&1; run c sync >/dev/null 2>&1
+out=$( (HIVE_TIDY_SESSION=1; export HIVE_TIDY_SESSION; run c sync --hook) 2>&1)
+check "a tidy session is not told, and leaves the notice for the next session" "! printf '%s' \"\$out\" | grep -q 'waits for your review' && [ \"\$(cat '$c/hive/decisions/tidy/upgrade-reported' 2>/dev/null)\" != https://github.com/o/hive/pull/8 ]"
+out=$(run c sync --hook 2>&1)
+check "a new upgrade pull request is told again" "printf '%s' \"\$out\" | grep -q 'upgrade of extras waits for your review: https://github.com/o/hive/pull/8'"
+printf -- '- Upgrade: https://github.com/o/hive/pull/9 (extras)\n- Upgrade: closed https://github.com/o/hive/pull/9\n' >>"$a/hive/decisions/tidy/$today.md"
+run c save >/dev/null 2>&1; run a save >/dev/null 2>&1
+out=$(run a sync --hook 2>&1)
+check "one the tidy logged as closed is not told" "! printf '%s' \"\$out\" | grep -q 'pull/9'"
 
 # R6: a newer tidy that found nothing to upgrade (and closed the pull request) leaves an older,
 # untold upgrade line behind.
