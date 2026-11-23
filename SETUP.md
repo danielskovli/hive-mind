@@ -83,6 +83,12 @@ default branch, commits `hive.lock` and pushes it the way memory is pushed; ever
 its next sync. Two machines upgrading at once both land, source by source. To go back, revert the
 commit that moved the pin.
 
+You rarely need to upgrade by hand: the daily tidy runs `hive upgrade --pr`, which opens a pull request in
+the hive, on the branch `hive/upgrade`, for every source whose repository has moved past its pin, with the
+incoming commits listed, asks you to review it (or assigns it to you, where `gh` acts as you), and keeps it
+current. Merging it is the upgrade, and the next session start tells you once that one waits. It needs
+`gh` signed in and a hive on GitHub; without them the tidy notes that and carries on.
+
 A source is never edited in place: the guard refuses it, as it refuses `hive.lock`. Change one by pull
 request in its own repository, from a clone elsewhere, then upgrade. To add a source, move one to a new
 URL (a fork, a transferred repository) or drop one, change its line in `hive.lock` by pull request in the
