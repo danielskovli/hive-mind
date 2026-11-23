@@ -1355,6 +1355,14 @@ ghj "[{\"number\": 9, \"url\": \"$closed\", \"state\": \"CLOSED\", \"headRefName
 out=$(prj 2>&1)
 check "R5: an upgrade the user closed unmerged is not proposed again until a source moves further" "[ \"\$(ghj_calls 'pr create')\" = 0 ] && ! grep -q '^pr edit' '$tmp/ghj/calls' && ! printf '%s' \"\$out\" | grep -q '^- Upgrade: '"
 
+# R3: hive.lock may hold comments; the pull request changes pins, nothing else.
+rm -rf "$tmp/up-c" && git clone -q "$tmp/up.git" "$tmp/up-c" &&
+    { printf '# Sources this hive runs; see SETUP.md.\n\n'; cat "$tmp/up-c/hive.lock"; } >"$tmp/up-c/lock.new" && mv "$tmp/up-c/lock.new" "$tmp/up-c/hive.lock" &&
+    git -C "$tmp/up-c" commit -qam "comment the lock" && git -C "$tmp/up-c" push -q origin main
+up_extras "R3 move" >/dev/null
+out=$(pr 2>&1)
+check "R3: the upgrade pull request keeps hive.lock's comments and blank lines, changing only the moved pin" "git --git-dir='$tmp/up.git' show hive/upgrade:hive.lock | grep -qx '# Sources this hive runs; see SETUP.md.' && [ \"\$(git --git-dir='$tmp/up.git' diff --numstat main hive/upgrade -- hive.lock | cut -f1-2)\" = \"\$(printf '1\t1')\" ]"
+
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
 machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
