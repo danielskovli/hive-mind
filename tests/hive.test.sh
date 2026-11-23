@@ -1341,6 +1341,12 @@ up_extras "R1 move" >/dev/null
 out=$(prj 2>&1)
 check "R1: with no upgrade pull request open, a real gh's empty answer still opens one" "[ \"\$(ghj_calls 'pr create')\" = 1 ] && [ \"\$(printf '%s\n' \"\$out\" | tail -n 1)\" = '- Upgrade: https://github.com/o/hive/pull/1 (extras)' ]"
 
+# R2: someone's fork has a branch named hive/upgrade too, with a pull request open from it.
+ghj '[{"number": 41, "url": "https://github.com/o/hive/pull/41", "state": "OPEN", "headRefName": "hive/upgrade", "isCrossRepository": true, "headRepositoryOwner": {"login": "mallory"}, "body": "x"}]'
+up_extras "R2 move" >/dev/null
+out=$(prj 2>&1)
+check "R2: a pull request from a fork's hive/upgrade is never taken for the upgrade one, retitled or rewritten" "! grep -q '^pr edit 41 ' '$tmp/ghj/calls' && ! printf '%s' \"\$out\" | grep -q 'pull/41'"
+
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
 machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
