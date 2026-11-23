@@ -109,9 +109,10 @@ questions: anything that needs the user goes into the log under "For the retro".
    sandboxes (for `sandbox/host-instructions.md`), and memories that are really tasks (for the
    Worklog: you have no Worklog tools here).
 8. **Upgrades.** Run `hive upgrade --pr`. It opens a pull request in the hive for every source whose
-   repository has moved past its pin, updates the open one, or closes it when nothing is left, and its
-   last line, while one is open, is `- Upgrade: <pull request URL> (<sources>)`. Copy that line into the
-   log under `## Upgrade`, exactly: the next interactive session tells the user from it. Whatever else it
+   repository has moved past its pin, updates the open one, or closes it when nothing is left. Its last
+   line is `- Upgrade: <pull request URL> (<sources>)` while one is open, and `- Upgrade: closed <URL>`
+   when it closed one. Copy that line into the log under `## Upgrade`, exactly: the next interactive
+   session tells the user from the newest log's line, and only of one still open. Whatever else it
    prints (skipped for want of gh or a hive on GitHub, a source it could not read) goes under the same
    heading in a line; it never stops the tidy.
 9. **Log.** Append to `decisions/tidy/<today>.md` (create it with the title `# Tidy, <today>`): why

@@ -7,7 +7,7 @@
 #   hive sync [--hook]         commit local memory, merge with origin, push, move the sources to their
 #                               pins, relink, rebuild the index, and run `settings`
 #   hive upgrade [source]      pin every source (or one) to its repository's newest commit, and push
-#   hive upgrade --pr [source] propose that as a pull request in the hive instead (the daily tidy)
+#   hive upgrade --pr [source] propose that as a pull request in the hive instead (each tidy)
 #   hive settings              bring the hive's keys in Claude Code's settings up to what this
 #                               core installs, where install has run; never in a sandbox
 #   hive save [--background]   commit memory/, decisions/ and worklog/ and push them
@@ -1732,15 +1732,16 @@ recorded_shape() {
 # Tells an interactive session that the newest tidy log with "- Drift:" lines found Claude Code changing
 # how memory works, so it reaches the user's Worklog. Once for the whole hive, not per machine: the
 # marker is committed and pushed like memory, so a new sandbox is not told about drift already handled.
-# Tells an interactive session, once for the whole hive, that the newest upgrade pull request a tidy
-# logged ("- Upgrade: <URL> (<sources>)") waits for review. The marker is pushed like memory, as drift's.
+# Tells an interactive session, once for the whole hive, that an upgrade pull request waits for review:
+# the last "- Upgrade:" line of the newest tidy log, when it names one open ("- Upgrade: <URL>
+# (<sources>)"), not one closed. The marker is pushed like memory, as drift's.
 report_upgrade() {
     [ -z "${HIVE_TIDY_SESSION:-}" ] || return 0
-    f=$(grep -l '^- Upgrade: ' "$hive"/decisions/tidy/*.md 2>/dev/null | sort | tail -n 1)
-    [ -n "$f" ] || return 0
+    f=$(printf '%s\n' "$hive"/decisions/tidy/*.md | sort | tail -n 1)
+    [ -f "$f" ] || return 0
     entry=$(grep '^- Upgrade: ' "$f" | tail -n 1)
     url=$(printf '%s\n' "$entry" | awk '{ print $3 }')
-    [ -n "$url" ] || return 0
+    case "$url" in https://*) ;; *) return 0 ;; esac
     [ "$(cat "$hive/decisions/tidy/upgrade-reported" 2>/dev/null)" = "$url" ] && return 0
     sources=$(printf '%s\n' "$entry" | sed -n 's/^[^(]*(\(.*\))[[:space:]]*$/\1/p')
     say "an upgrade of ${sources:-the sources} waits for your review: $url"
@@ -1897,7 +1898,7 @@ cmd_upgrade() {
             say "$name is at its repository's newest commit, $(short "$sha")"
             continue
         fi
-        awk -v n="$name" -v s="$new" '$1 == n && NF == 3 { $3 = s } { print }' "$state/lock.new" >"$state/lock.tmp"
+        repin "$name" "$new" <"$state/lock.new" >"$state/lock.tmp"
         mv "$state/lock.tmp" "$state/lock.new"
         moved="$moved $name"
         say "$name: $(short "$sha") to $(short "$new")"
@@ -1931,20 +1932,60 @@ github_web() {
         sed 's/\.git$//' | awk 'NF { print "https://github.com/" $0 }'
 }
 
+# repin <name> <commit>: on stdin a hive.lock, on stdout the same with only <name>'s pin changed;
+# comments, blank lines and every other line stay as they were.
+repin() {
+    awk -v n="$1" -v s="$2" '$1 == n && NF == 3 && $1 !~ /^#/ { sub(/[0-9a-f]+[[:space:]]*$/, s) } { print }'
+}
+
+# commit_list <web> <limit>: on stdin "<sha> <subject>" lines, newest first; on stdout a Markdown list of
+# at most <limit>, each subject in a code span, so whatever its author wrote (a closing keyword, a
+# mention, an HTML comment) renders as text and acts on nothing, then how many more there are.
+commit_list() {
+    # shellcheck disable=SC2016 # Python, and backticks as text
+    python3 -I -c '
+import re, sys
+web, limit = sys.argv[1], int(sys.argv[2])
+rows = [l.rstrip("\n").split(" ", 1) for l in sys.stdin if l.strip()]
+for sha, subject in (r + [""] if len(r) == 1 else r for r in rows[:limit]):
+    subject = re.sub(r"[\x00-\x1f\x7f]", " ", subject)
+    fence = "`" * (max((len(m) for m in re.findall(r"`+", subject)), default=0) + 1)
+    ref = "[%s](%s/commit/%s)" % (sha[:7], web, sha) if web else sha[:7]
+    print("- %s %s %s %s" % (ref, fence, subject, fence) if subject.strip() else "- %s" % ref)
+if len(rows) > limit:
+    print("- … and %d more, in the compare below" % (len(rows) - limit))
+' "$1" "$2"
+}
+
 # `upgrade --pr [source]`: proposes, as one pull request in the hive, pinning every source (or one) to
-# its repository's newest commit. Deterministic, for the daily tidy: the commit is built on a fixed
-# branch, hive/upgrade, from origin/main in the private worktree, so the live checkout never moves; the
-# pull request is opened once and updated after, and closed when nothing is left to upgrade. Without gh,
-# signed in, and a hive on GitHub, it says why and does nothing: the tidy logs that and moves on. Its
-# last line, for the tidy's log, is "- Upgrade: <pull request URL> (<sources>)" while one is open.
+# its repository's newest commit. Deterministic, for each tidy: the commit is built on a fixed branch,
+# hive/upgrade, from origin/main in the private worktree, so the live checkout never moves; the pull
+# request is opened once and updated after, left alone while nothing changed, and closed when nothing is
+# left to upgrade. Pins the user turned down (a pull request closed unmerged) are not proposed again
+# until a source moves past them. Without gh, signed in to github.com, and a hive on GitHub, it says why
+# and does nothing: the tidy logs that and moves on. Its last line, for the tidy's log, is
+# "- Upgrade: <pull request URL> (<sources>)" while one is open, "- Upgrade: closed <URL>" when it
+# closed one.
 cmd_upgrade_pr() {
     branch_pr=hive/upgrade
     origin_url=$(g config --get remote.origin.url 2>/dev/null || true)
     web=$(github_web "$origin_url")
     if ! command -v "$gh_command" >/dev/null 2>&1; then say "upgrade --pr skipped: gh is not installed"; return 0; fi
-    if ! "$gh_command" auth status >/dev/null 2>&1; then say "upgrade --pr skipped: gh is not signed in (gh auth login)"; return 0; fi
+    if ! "$gh_command" auth status --hostname github.com --active >/dev/null 2>&1; then
+        say "upgrade --pr skipped: gh is not signed in to github.com (gh auth login)"
+        return 0
+    fi
     if [ -z "$web" ]; then say "upgrade --pr skipped: the hive's origin, ${origin_url:-none}, is not on GitHub"; return 0; fi
     slug=${web#https://github.com/}
+    # Our own pull requests only: from this repository's hive/upgrade into main, never a fork's branch
+    # of the same name. An empty list is none (gh's --jq prints "null" for a missing element).
+    ours='.[] | select(.isCrossRepository == false and .headRefName == "'$branch_pr'" and .baseRefName == "'$branch'")'
+    fields=number,url,body,isCrossRepository,headRefName,baseRefName,mergedAt
+    if ! open=$("$gh_command" pr list -R "$slug" --head "$branch_pr" --state open --json "$fields" \
+        --jq "[$ours] | .[0] // empty | \"\\(.number) \\(.url)\"" 2>"$state/err"); then
+        say "upgrade --pr skipped: could not list the hive's pull requests: $(tail -n 1 "$state/err")"
+        return 0
+    fi
     lock 30 || die "another hive command held the lock for 30 seconds; try again"
     if ! gnet fetch -q origin "$branch" </dev/null 2>"$state/err"; then
         die "upgrade --pr: could not fetch origin: $(grep -v '^hint:' "$state/err" | tail -n 1)"
@@ -1954,11 +1995,10 @@ cmd_upgrade_pr() {
     if [ -n "${1:-}" ] && ! awk -v n="$1" '$1 == n { f = 1 } END { exit !f }' "$state/upgrade-pins"; then
         die "hive.lock pins no source named $1"
     fi
-    open=$("$gh_command" pr list -R "$slug" --head "$branch_pr" --state open --json number,url --jq '.[0] | "\(.number) \(.url)"' 2>/dev/null || true)
-    cp "$state/upgrade-pins" "$state/upgrade-lock"
+    g show "$base:hive.lock" >"$state/upgrade-lock"
     body="$state/upgrade-body.md"
     : >"$body"
-    moved="" forced=""
+    moved="" forced="" proposed=""
     while read -r name url sha; do
         [ -z "${1:-}" ] || [ "$name" = "$1" ] || continue
         new=$(gnet ls-remote "$url" HEAD </dev/null 2>"$state/err" | awk 'NR == 1 { print $1 }')
@@ -1969,70 +2009,112 @@ cmd_upgrade_pr() {
             continue
         fi
         moved="$moved $name"
-        awk -v n="$name" -v s="$new" '$1 == n && NF == 3 { $3 = s } { print }' "$state/upgrade-lock" >"$state/upgrade-lock.tmp"
+        proposed="$proposed $name=$new"
+        repin "$name" "$new" <"$state/upgrade-lock" >"$state/upgrade-lock.tmp"
         mv "$state/upgrade-lock.tmp" "$state/upgrade-lock"
         src=$(github_web "$url")
         dir="$hive/$name"
         {
             printf '### %s: %s → %s\n\n' "$name" "$(short "$sha")" "$(short "$new")"
-            if gitc -C "$dir" merge-base --is-ancestor "$sha" "$new" 2>/dev/null; then
-                from=$sha
-            else
+            from=$(gitc -C "$dir" merge-base "$sha" "$new" 2>/dev/null || true)
+            if [ -z "$from" ]; then
+                printf '> [!WARNING]\n> **%s has no history in common with its pin, %s:** the repository was replaced. Read it before merging.\n\n' "$name" "$(short "$sha")"
                 forced="$forced $name"
-                from=$(gitc -C "$dir" merge-base "$sha" "$new" 2>/dev/null || true)
-                printf '> [!WARNING]\n> **%s was force-pushed:** its newest commit does not contain the pinned one, %s. Commits only the pin had would leave this hive. Read the compare before merging.\n\n' \
-                    "$name" "$(short "$sha")"
+            else
+                if [ "$from" != "$sha" ]; then
+                    forced="$forced $name"
+                    printf '> [!WARNING]\n> **%s was force-pushed:** its newest commit does not contain the pinned one, %s. Commits only the pin had would leave this hive. Read the compare before merging.\n\n' \
+                        "$name" "$(short "$sha")"
+                fi
+                gitc -C "$dir" log --format='%H %s' "$from..$new" | commit_list "$src" 50
             fi
-            gitc -C "$dir" log --format='%H %s' "${from:+$from..}$new" | while read -r c subject; do
-                if [ -n "$src" ]; then printf -- '- [%s](%s/commit/%s) %s\n' "$(short "$c")" "$src" "$c" "$subject"
-                else printf -- '- %s %s\n' "$(short "$c")" "$subject"; fi
-            done
             [ -z "$src" ] || printf '\nCompare: %s/compare/%s...%s\n' "$src" "$sha" "$new"
             printf '\n'
         } >>"$body"
     done <"$state/upgrade-pins"
     if [ -z "$moved" ]; then
+        unlock
         if [ -n "$open" ]; then
-            "$gh_command" pr close "${open%% *}" -R "$slug" --comment "Every source is at its pin's newest commit now, so there is nothing left to upgrade." >/dev/null 2>&1 \
-                || say "upgrade --pr: could not close ${open#* }"
+            if "$gh_command" pr close "${open%% *}" -R "$slug" --comment "Every source is at its pin's newest commit now, so there is nothing left to upgrade." >/dev/null 2>&1; then
+                printf -- '- Upgrade: closed %s\n' "${open#* }"
+            else
+                say "upgrade --pr: could not close ${open#* }"
+            fi
         fi
         return 0
+    fi
+    # The pins, in the body's last line: how a later run knows what a pull request the user closed proposed.
+    marker="Proposed pins: \`$(printf '%s' "$proposed" | sed 's/^ //')\`"
+    if [ -z "$open" ]; then
+        # shellcheck disable=SC2016 # the backticks are the marker's code span
+        declined=$("$gh_command" pr list -R "$slug" --head "$branch_pr" --state closed --json "$fields" \
+            --jq "[$ours] | .[0] // empty | select(.mergedAt == null) | .body" 2>/dev/null | grep -x 'Proposed pins: `.*`' | tail -n 1 || true)
+        if [ "$declined" = "$marker" ]; then
+            say "upgrade --pr: these pins were turned down in a pull request closed unmerged; proposing again once a source moves past them"
+            return 0
+        fi
     fi
     names=$(printf '%s' "$moved" | sed 's/^ //; s/ /, /g')
     {
         printf 'Pins %s to the newest commit of each repository'\''s default branch. Merging it is the upgrade: every machine moves to the new pins at its next sync.\n\n' "$names"
         cat "$body"
         # shellcheck disable=SC2016 # Markdown backticks
-        printf 'Opened by the daily tidy (`hive upgrade --pr`), which updates this pull request while it stays open.\n'
+        printf 'Opened by the tidy (`hive upgrade --pr`), which updates this pull request while it stays open. Closing it unmerged turns these pins down until a source moves further.\n\n%s\n' "$marker"
     } >"$body.full"
-    # The commit: origin/main with the new pins, nothing else, in the private worktree.
+    # GitHub refuses a body over 65536 characters: cut the lists, keeping the marker.
+    if [ "$(wc -c <"$body.full" | tr -d ' ')" -gt 60000 ]; then
+        { head -c 58000 "$body.full" | sed '$d'; printf '\n\n(Cut to fit GitHub'\''s limit: each compare above has the rest.)\n\n%s\n' "$marker"; } >"$body.cut"
+        mv "$body.cut" "$body.full"
+    fi
+    # The commit: origin/main with the new pins, nothing else, in the private worktree. A tree that is
+    # already the branch's (nothing moved since the last run) is neither pushed nor edited.
     worktree_at "$base" || die "upgrade --pr: $(cat "$state/error")"
     cp "$state/upgrade-lock" "$wt/hive.lock"
     w add -- hive.lock
-    w commit -q --no-verify -m "hive.lock: upgrade $names" -m "Hive-Host: $(where)
+    current=$(gnet ls-remote origin "refs/heads/$branch_pr" </dev/null 2>/dev/null | awk 'NR == 1 { print $1 }')
+    changed=1
+    if [ -n "$current" ] && gnet fetch -q origin "$current" </dev/null 2>/dev/null \
+        && [ "$(g rev-parse "$current^{tree}" 2>/dev/null)" = "$(w write-tree)" ] && [ "$(g rev-parse "$current^" 2>/dev/null)" = "$base" ]; then
+        changed=0
+    fi
+    if [ "$changed" = 1 ]; then
+        w commit -q --no-verify -m "hive.lock: upgrade $names" -m "Hive-Host: $(where)
 Hive-Session: ${CLAUDE_CODE_SESSION_ID:-none}" -- hive.lock
-    if ! gnet push -q -f origin "$(w rev-parse HEAD):refs/heads/$branch_pr" </dev/null 2>"$state/err"; then
-        die "upgrade --pr: could not push $branch_pr: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+        if ! gnet push -q -f origin "$(w rev-parse HEAD):refs/heads/$branch_pr" </dev/null 2>"$state/err"; then
+            die "upgrade --pr: could not push $branch_pr: $(grep -v '^hint:' "$state/err" | tail -n 1)"
+        fi
     fi
     unlock
     title="Upgrade $names"
     if [ -n "$open" ]; then
         number=${open%% *} url=${open#* }
-        "$gh_command" pr edit "$number" -R "$slug" --title "$title" --body-file "$body.full" >/dev/null 2>&1 || say "upgrade --pr: could not update $url"
+        # Merged or closed while this ran: not ours to edit, nor waiting any more.
+        if [ "$("$gh_command" pr view "$number" -R "$slug" --json state --jq .state 2>/dev/null)" != OPEN ]; then
+            say "upgrade --pr: $url was merged or closed meanwhile; the next run proposes what is left"
+            return 0
+        fi
+        if [ "$changed" = 1 ]; then
+            "$gh_command" pr edit "$number" -R "$slug" --title "$title" --body-file "$body.full" >/dev/null 2>&1 || say "upgrade --pr: could not update $url"
+        fi
     else
         url=$("$gh_command" pr create -R "$slug" --head "$branch_pr" --base "$branch" --title "$title" --body-file "$body.full" 2>"$state/err" | tail -n 1)
         [ -n "$url" ] || die "upgrade --pr: could not open the pull request: $(tail -n 1 "$state/err")"
-        # The hive's owner reviews it; GitHub refuses a review request to the pull request's own author,
-        # so where gh acts as the owner, the owner is assigned instead.
+        # The hive's owner reviews it. GitHub refuses a review request to the pull request's author, and
+        # an organisation can be neither: there the one gh acts as is assigned. Each call on its own,
+        # so one refused does not drop the other.
         owner=$("$gh_command" repo view "$slug" --json owner --jq .owner.login 2>/dev/null || true)
+        org=$("$gh_command" repo view "$slug" --json isInOrganization --jq .isInOrganization 2>/dev/null || true)
         me=$("$gh_command" api user --jq .login 2>/dev/null || true)
-        if [ -n "$owner" ] && [ "$owner" = "$me" ]; then
-            "$gh_command" pr edit "$url" -R "$slug" --add-assignee "$owner" >/dev/null 2>&1 || true
+        if [ "$org" = true ]; then
+            [ -z "$me" ] || "$gh_command" pr edit "$url" -R "$slug" --add-assignee "$me" >/dev/null 2>&1 || say "upgrade --pr: could not assign $me"
         elif [ -n "$owner" ]; then
-            "$gh_command" pr edit "$url" -R "$slug" --add-reviewer "$owner" --add-assignee "$owner" >/dev/null 2>&1 || true
+            "$gh_command" pr edit "$url" -R "$slug" --add-assignee "$owner" >/dev/null 2>&1 || say "upgrade --pr: could not assign $owner"
+            if [ "$owner" != "$me" ]; then
+                "$gh_command" pr edit "$url" -R "$slug" --add-reviewer "$owner" >/dev/null 2>&1 || say "upgrade --pr: could not ask $owner to review"
+            fi
         fi
     fi
-    [ -z "$forced" ] || say "upgrade --pr: force-pushed, flagged in the pull request:$forced"
+    [ -z "$forced" ] || say "upgrade --pr: flagged in the pull request, its history rewritten:$forced"
     printf -- '- Upgrade: %s (%s)\n' "$url" "$names"
 }
 
