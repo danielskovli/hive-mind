@@ -1363,6 +1363,20 @@ up_extras "R3 move" >/dev/null
 out=$(pr 2>&1)
 check "R3: the upgrade pull request keeps hive.lock's comments and blank lines, changing only the moved pin" "git --git-dir='$tmp/up.git' show hive/upgrade:hive.lock | grep -qx '# Sources this hive runs; see SETUP.md.' && [ \"\$(git --git-dir='$tmp/up.git' diff --numstat main hive/upgrade -- hive.lock | cut -f1-2)\" = \"\$(printf '1\t1')\" ]"
 
+# R4: commit subjects come from the source's authors, and GitHub renders the body.
+up_extras "Fixes #1, thanks @someone" >/dev/null
+up_extras "<!-- hides every older commit below" >/dev/null
+out=$(pr 2>&1)
+# Fails when a line of <body>, code spans aside, holds an HTML comment, the mention or the closing keyword.
+body_hazards() {
+    python3 -I -c 'import re, sys
+for line in open(sys.argv[1]):
+    bare = re.sub(r"`[^`]*`", "", line)
+    if "<!--" in bare or "@someone" in bare or re.search(r"(?i)fixes #1", bare):
+        sys.exit(1)' "$1"
+}
+check "R4: a source's commit subjects cannot close the hive's issues, mention people or hide lines in the body" "body_hazards '$tmp/gh/body'"
+
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
 machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
