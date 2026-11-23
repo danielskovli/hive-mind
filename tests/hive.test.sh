@@ -1347,6 +1347,14 @@ up_extras "R2 move" >/dev/null
 out=$(prj 2>&1)
 check "R2: a pull request from a fork's hive/upgrade is never taken for the upgrade one, retitled or rewritten" "! grep -q '^pr edit 41 ' '$tmp/ghj/calls' && ! printf '%s' \"\$out\" | grep -q 'pull/41'"
 
+# R5: the user closed the upgrade pull request without merging it, and no source has moved since.
+ghj '[]'
+rm -f "$tmp/gh/open"; out=$(pr 2>&1)
+closed=$(printf '%s\n' "$out" | tail -n 1 | awk '{ print $3 }')
+ghj "[{\"number\": 9, \"url\": \"$closed\", \"state\": \"CLOSED\", \"headRefName\": \"hive/upgrade\", \"isCrossRepository\": false, \"headRepositoryOwner\": {\"login\": \"o\"}, \"body\": \"x\"}]"
+out=$(prj 2>&1)
+check "R5: an upgrade the user closed unmerged is not proposed again until a source moves further" "[ \"\$(ghj_calls 'pr create')\" = 0 ] && ! grep -q '^pr edit' '$tmp/ghj/calls' && ! printf '%s' \"\$out\" | grep -q '^- Upgrade: '"
+
 # The core comes first in hive.lock, as hive-mind, and runs from that clone; anything else fails clearly.
 git clone -q --bare "$tmp/remote.git" "$tmp/rt-core.git"
 machine cf "$tmp/rt-core.git" && run cf install >/dev/null 2>&1
