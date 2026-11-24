@@ -58,4 +58,8 @@ Changes come by pull request. `sh tests/check.sh` runs every check offline, agai
 `template/`; CI runs it on Linux and macOS. The core names no person and no employer, and a check keeps
 it that way.
 
+A change to `bin/hive` or the tests runs the full suite before it is pushed; for instructions, skills
+and docs, CI is enough. Mutation-test each new check with `sh tests/hive.test.sh` alone, one run at a
+time: its timing-based checks flake under CPU contention.
+
 MIT licensed.
