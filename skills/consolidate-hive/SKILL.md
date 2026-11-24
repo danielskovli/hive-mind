@@ -63,6 +63,10 @@ Work through these in order, and stop changing things once the budget holds and 
 versions; the rest can wait for the next tidy, except steps 4 to 9, which every tidy runs. Never ask
 questions: anything that needs the user goes into the log under "For the retro".
 
+The tidy runs with an allowlist and refuses whatever it doesn't name, without asking. It names plain
+commands (`git log …`, `git show …`, `gh pr view …`, `hive index`), so run each one on its own from the
+hive checkout, the working directory: no `cd … &&`, `git -C`, pipes or `;`, which it refuses whole.
+
 1. **Two versions.** For each file containing `<!-- hive:sibling -->`: merge the versions into
    one, keeping what each learned. `git log -p -- <file>` shows which side is newer. Where they
    contradict and you cannot tell which is right from the code or the history, keep the newer one,
