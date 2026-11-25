@@ -79,9 +79,10 @@ sets Claude Code's settings, as that section lists. Read its output to the user:
 ## agentctl
 
 For each agent definition from answer 6, follow `<core>/SETUP.md`, section "agentctl": write
-`agent.mine.yaml` beside its `agent.yaml`, with the pointer first and then every file the manifest's
-`instructions` lists, copied from it, and `home` set to `~/hive/sandbox/home`; keep the manifest's other
-keys out unless the user wants to change them. Check that Git ignores the variant before you write it.
+`agent.mine.yaml` beside its `agent.yaml`, with the pointer as its only `instructions` entry and `home`
+set to `~/hive/sandbox/home`; keep the manifest's other keys out unless the user wants to change them.
+Check `agentctl --version` first: one older than 0.1.0-preview.15 would drop the manifest's own
+instruction files. Check that Git ignores the variant before you write it.
 Never edit `agent.yaml` or any other file the repository tracks.
 
 Then tell the user, and do none of it yourself:

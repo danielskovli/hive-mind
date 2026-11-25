@@ -102,8 +102,8 @@ agentd starts every agent's instructions with its own "About this sandbox", then
 manifest lists, in order. The committed manifest, `agent.yaml`, is the team's. What is yours, the hive's
 pointer among it, goes in a variant beside it, `agent.mine.yaml`. Check that Git ignores it
 (`git check-ignore agent.mine.yaml`); if the repository doesn't, add it to `.git/info/exclude` rather
-than to a file the team shares. Your variant lists the pointer ahead of the agent's own instructions, and
-gives the agent the core's sandbox home:
+than to a file the team shares. Your variant adds the pointer to the agent's instructions and gives the
+agent the core's sandbox home:
 
 ```yaml
 apiVersion: agents.platform/v1alpha1
@@ -116,15 +116,12 @@ spec:
     source: ~/hive/sandbox/home
   instructions:
     - source: ~/hive/sandbox/host-instructions.md
-    - source: instructions.md   # then every other file agent.yaml lists
 ```
 
-Apply it with `agentctl apply --variant mine`. A variant replaces `instructions` whole, so after the
-pointer it names every file the manifest's `instructions` list, in the same order and with the same
-paths (the variant sits beside the manifest). A manifest often lists several, some in a parent folder;
-copy the list from `agent.yaml` rather than the snippet above, and compare the two again when the
-manifest changes, since they drift. agentd reads the files on every pass, so running agents pick up a
-change within a minute.
+Apply it with `agentctl apply --variant mine`. A variant merges `instructions` with the manifest's by
+`source`, so it names only the pointer, which follows the manifest's own files. An agentctl older than
+0.1.0-preview.15 replaces the list whole instead, and drops them: upgrade it first. agentd reads the
+files on every pass, so running agents pick up a change within a minute.
 
 `home` replaces the agent's own home overlay whole, and agentd copies it over `/home/agent` every 30
 seconds, so the hive's settings stay put (`sandbox/README.md`). `hive install` and every sync on this
