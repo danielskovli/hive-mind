@@ -100,9 +100,10 @@ on disk.
 
 agentd starts every agent's instructions with its own "About this sandbox", then the files the agent's
 manifest lists, in order. The committed manifest, `agent.yaml`, is the team's. What is yours, the hive's
-pointer among it, goes in a variant beside it, `agent.mine.yaml`, which the agent's `.gitignore` keeps
-out of Git. Your variant lists the pointer ahead of the agent's own instructions, and gives the agent
-the core's sandbox home:
+pointer among it, goes in a variant beside it, `agent.mine.yaml`. Check that Git ignores it
+(`git check-ignore agent.mine.yaml`); if the repository doesn't, add it to `.git/info/exclude` rather
+than to a file the team shares. Your variant adds the pointer to the agent's instructions and gives the
+agent the core's sandbox home:
 
 ```yaml
 apiVersion: agents.platform/v1alpha1
@@ -115,17 +116,24 @@ spec:
     source: ~/hive/sandbox/home
   instructions:
     - source: ~/hive/sandbox/host-instructions.md
-    - source: instructions.md
 ```
 
-Apply it with `agentctl apply --variant mine`. A variant replaces `instructions` whole, so yours names
-the manifest's instruction files again. agentd reads the files on every pass, so running agents pick up
-a change within a minute.
+Apply it with `agentctl apply --variant mine`. A variant merges `instructions` with the manifest's by
+`source`, so it names only the pointer, which follows the manifest's own files. An agentctl older than
+0.1.0-preview.15 replaces the list whole instead, and drops them: upgrade it first. agentd reads the
+files on every pass, so running agents pick up a change within a minute.
 
 `home` replaces the agent's own home overlay whole, and agentd copies it over `/home/agent` every 30
 seconds, so the hive's settings stay put (`sandbox/README.md`). `hive install` and every sync on this
-machine write that home, outside the hive's history. agentctl refuses to change an existing
-agent's home, so delete the agent and apply it again.
+machine write that home, outside the hive's history. Whatever the agent's own overlay held is gone from
+your sandboxes, so read it first (the folder its `home.source` names):
+
+- Claude Code settings in its `.claude/settings.json`, such as `attribution`: put those you want in the
+  hive's own `settings.json`, which `install` writes into the sandbox home too.
+- Files for other tools, such as another harness's configuration: the hive's home has no place for them,
+  so those tools go without them in your sandboxes.
+
+agentctl refuses to change an existing agent's home, so delete the agent and apply it again.
 
 For each agent:
 
@@ -133,7 +141,8 @@ For each agent:
   agent alone. Nothing the hive says; `hive status` inside the sandbox flags sections both have.
 - A skill its definition ships wins over the hive's of the same name: `hive install` leaves it to agentd,
   and `hive status` names it.
-- Its GitHub account can push to your hive.
+- The GitHub account it pushes as (the `accounts` of your variant, else of the manifest) has write
+  access to your hive.
 - An agent that should not get the hive has no pointer in your variant.
 
 The first session in a new sandbox brings the hive up itself, following the pointer; later sessions load
