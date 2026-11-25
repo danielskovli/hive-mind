@@ -33,6 +33,8 @@ https://github.com/danielskovli/hive-mind to a temporary folder). `<core>` below
    Default yes.
 5. Whether they want the Worklog, a task tracker page on claude.ai that sessions read and write. It can
    be added later with the worklog-setup skill.
+6. Whether they run agents in agentctl sandboxes, and if so, which agent definitions (the folders holding
+   an `agent.yaml`) should get the hive.
 
 ## The repository
 
@@ -49,6 +51,10 @@ Then fill in `$work`:
   line.
 - `instructions/me.md`: replace every placeholder from their answers, and remove the comment.
 - `sandbox/host-instructions.md`: replace `https://github.com/OWNER/hive` with the hive's URL.
+- With agentctl agents (answer 6): read each one's home overlay, the folder its `home.source` names. The
+  hive's sandbox home will replace it (`<core>/SETUP.md`, "agentctl"), so put the keys of its
+  `.claude/settings.json` the user wants to keep, such as `attribution`, in `$work/settings.json`, and
+  note any other files it holds to tell them about.
 - Check that no placeholder is left: `grep -rn -e 0000000000000000000000000000000000000000 -e OWNER
   -e NAME -e GITHUB_USER -e "WHAT THEY" -e "WHERE TASKS" "$work"` prints nothing.
 
@@ -69,6 +75,21 @@ sets Claude Code's settings, as that section lists. Read its output to the user:
 - `skipped: …`: a skill or rule of theirs is in the way. Show which, and ask before `--force`, which
   moves it to `~/.claude/hive-backup/`.
 - `hive status` lines marked `fix` name what is wrong and the section of `SETUP.md` to read.
+
+## agentctl
+
+For each agent definition from answer 6, follow `<core>/SETUP.md`, section "agentctl": write
+`agent.mine.yaml` beside its `agent.yaml`, with the pointer first and then every file the manifest's
+`instructions` lists, copied from it, and `home` set to `~/hive/sandbox/home`; keep the manifest's other
+keys out unless the user wants to change them. Check that Git ignores the variant before you write it.
+Never edit `agent.yaml` or any other file the repository tracks.
+
+Then tell the user, and do none of it yourself:
+
+- The GitHub account each agent pushes as needs write access to the hive.
+- The files from its home overlay that its sandboxes will now go without, if any.
+- An agent that exists already must be deleted and applied again (`agentctl apply --variant mine`)
+  before it gets the hive's home; deleting it wipes its sandbox.
 
 ## Afterwards
 
