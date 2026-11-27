@@ -1011,6 +1011,9 @@ check "a skill only a source has links to the source's" "[ \"\$(lnk a extra-one)
 check "the hive's own skill wins over a source's of the same name" "[ \"\$(lnk a shared)\" = '$a/hive/skills/shared' ]"
 check "a source's skill wins over the core's of the same name" "[ \"\$(lnk a worklog-setup)\" = '$a/hive/extras/skills/worklog-setup' ]"
 check "a skill only the core has links to the core's" "[ \"\$(lnk a consolidate-hive)\" = '$a/hive/hive-mind/skills/consolidate-hive' ]"
+machine hand && git clone -q "$tmp/extras.git" "$tmp/hand/hive/extras"
+run hand sync >/dev/null 2>&1
+check "sync keeps a source cloned by hand out of the hive's history" "[ -z \"\$(git -C '$tmp/hand/hive' status --porcelain -- extras)\" ]"
 git clone -q "$tmp/remote.git" "$tmp/pr3" && git -C "$tmp/pr3" rm -q -r skills/shared && git -C "$tmp/pr3" commit -qm "drop shared" && git -C "$tmp/pr3" push -q origin main
 run a sync >/dev/null 2>&1
 check "when the hive drops a skill, the next layer's takes its place" "[ \"\$(lnk a shared)\" = '$a/hive/extras/skills/shared' ]"

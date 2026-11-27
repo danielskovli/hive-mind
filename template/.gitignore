@@ -3,7 +3,7 @@ memory/MEMORY.md
 memory/.MEMORY.md.*
 
 # The core, a clone made before the engine runs. Sync keeps the other sources hive.lock pins out of
-# this repository's history in .git/info/exclude, as it clones each.
+# this repository's history in .git/info/exclude, whoever cloned them.
 /hive-mind/
 
 .DS_Store
