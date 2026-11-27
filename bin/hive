@@ -1090,11 +1090,10 @@ except ValueError as e:
 before = json.loads(json.dumps(s))
 
 def mine(group):
-    # This checkout's hooks, and any other checkout's: a hive cloned somewhere new replaces them, and so
-    # does one taking over from its predecessor, agent-brain's bin/brain.
+    # This checkout's hooks, and any other checkout's: a hive cloned somewhere new replaces them.
     for h in group.get("hooks", []):
         c = h.get("command", "")
-        if c.startswith(quoted + " ") or (("bin/hive" in c or "bin/brain" in c) and c.endswith((" sync --hook", " save --background", " guard",
+        if c.startswith(quoted + " ") or ("bin/hive" in c and c.endswith((" sync --hook", " save --background", " guard",
                                                                           " keepalive stop", " keepalive prompt", " keepalive end"))):
             return True
     return False
