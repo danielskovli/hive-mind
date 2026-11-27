@@ -541,8 +541,9 @@ fetch_pin() {
             fail_with "source $fp_name: could not clone $fp_url: $(grep -v '^hint:' "$state/err" | tail -n 1)"
             return 1
         fi
-        exclude_path "$fp_name"
     fi
+    # Whoever made the clone: one made by hand, as setting up a machine does, is excluded too.
+    exclude_path "$fp_name"
     # The lock's URL is where the source lives now (a fork, a moved repository), whatever the clone
     # was made from.
     if [ "$(gitc -C "$fp_dir" config --get remote.origin.url 2>/dev/null)" != "$fp_url" ]; then
