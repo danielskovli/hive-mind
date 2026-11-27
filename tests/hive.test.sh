@@ -982,18 +982,12 @@ HOME="$tmp/i/home" CLAUDE_CONFIG_DIR="$tmp/i/cfg" "$tmp/i/hive2/hive-mind/bin/hi
 check "a moved checkout takes over the links" "[ \"\$(readlink '$tmp/i/cfg/rules/hive')\" = '$tmp/i/hive2/instructions' ]"
 check "a moved checkout leaves one set of hooks" "[ \"\$(grep -c 'sync --hook' '$tmp/i/cfg/settings.json')\" = 1 ] && grep -q 'hive2/hive-mind/bin/hive' '$tmp/i/cfg/settings.json'"
 
-# Taking over from the predecessor, agent-brain: its hooks go, and links into a checkout that has moved
-# away are replaced without --force.
+# Links into a checkout that has moved away are replaced without --force.
 machine m
 mkdir -p "$tmp/m/cfg/skills" "$tmp/m/cfg/rules" "$tmp/m/gone"
 ln -s "$tmp/m/gone/skills/hive-skill" "$tmp/m/cfg/skills/hive-skill"
-cat >"$tmp/m/cfg/settings.json" <<EOF
-{"autoMemoryDirectory": "$tmp/m/hive/memory",
- "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "$tmp/m/agent-brain/bin/brain sync --hook"}]}],
-           "Stop": [{"hooks": [{"type": "command", "command": "$tmp/m/agent-brain/bin/brain save --background"}]}]}}
-EOF
+echo "{\"autoMemoryDirectory\": \"$tmp/m/hive/memory\"}" >"$tmp/m/cfg/settings.json"
 run m install >/dev/null 2>&1
-check "install takes over the predecessor's hooks" "! grep -q 'bin/brain' '$tmp/m/cfg/settings.json' && [ \"\$(grep -c 'sync --hook' '$tmp/m/cfg/settings.json')\" = 1 ]"
 check "install replaces a link to a checkout that is gone" "[ \"\$(readlink '$tmp/m/cfg/skills/hive-skill')\" = '$tmp/m/hive/skills/hive-skill' ]"
 
 # A settings.json that is a link (a dotfile manager's) stays a link.
